@@ -1,0 +1,1029 @@
+# ui_main_window.py
+import sys
+import os
+import pathlib
+import traceback
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QFileDialog, QListWidget, QListWidgetItem, QLabel, QTextEdit,
+    QMessageBox, QProgressBar, QSizePolicy, QStyleFactory, QStyle,
+    QDialog, QTreeView, QDialogButtonBox, QScrollArea, QTabWidget, QSpacerItem,
+    QComboBox
+)
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QPalette, QColor
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QObject, QDir, QModelIndex
+)
+
+# Local imports
+from config import MERGE_FORMATS, PATH_DATA_ROLE, TYPE_DATA_ROLE, BASE_PATH_DATA_ROLE
+from workers import MergerWorker, SplitterWorker # WorkerSignals is used internally by workers
+from dialogs import FolderSelectionDialog
+
+
+# --- Main Application Window ---
+class MergerSplitterApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._items_to_merge_internal = [] # List[Tuple(type, path, base_path)]
+        self.output_merge_file = ""
+        self.input_split_file = ""
+        self.output_split_dir = ""
+        self.worker_thread = None
+        self.worker = None
+        self._error_shown = False # Flag to prevent multiple critical error popups
+
+        # Icons (will be loaded in apply_dark_style)
+        self.folder_icon = QIcon()
+        self.file_icon = QIcon()
+
+        self.initUI()
+        self.apply_dark_style()
+        self._populate_format_combos() # Populate dropdowns after UI init
+
+    def initUI(self):
+        self.setObjectName("MergerSplitterAppWindow") # For styling hook
+        self.setWindowTitle('File Merger & Splitter (Multi-Format)')
+        self.setGeometry(150, 150, 850, 800) # Initial size and position
+
+        main_layout = QVBoxLayout(self)
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget, 1) # Tabs take most space
+
+        # --- Create Tabs ---
+        self.merge_tab = QWidget()
+        self.split_tab = QWidget()
+        self.tab_widget.addTab(self.merge_tab, " Merge Files/Folders ")
+        self.tab_widget.addTab(self.split_tab, " Split Merged File ")
+
+        # --- Populate Merge Tab ---
+        merge_layout = QVBoxLayout(self.merge_tab)
+
+        # Top Buttons (Add/Remove)
+        select_items_layout = QHBoxLayout()
+        self.add_files_button = QPushButton("Add Files...")
+        self.add_folder_button = QPushButton("Add Folder...")
+        self.remove_item_button = QPushButton("Remove Selected")
+        self.clear_list_button = QPushButton("Clear List")
+        select_items_layout.addWidget(self.add_files_button)
+        select_items_layout.addWidget(self.add_folder_button)
+        select_items_layout.addSpacing(20)
+        select_items_layout.addWidget(self.remove_item_button)
+        select_items_layout.addWidget(self.clear_list_button)
+        select_items_layout.addStretch()
+        merge_layout.addLayout(select_items_layout)
+
+        # Tree View for Items to Merge
+        merge_layout.addWidget(QLabel("<b>Items to Merge:</b>"))
+        self.item_list_view = QTreeView()
+        self.item_list_view.setHeaderHidden(True)
+        self.item_model = QStandardItemModel()
+        self.item_list_view.setModel(self.item_model)
+        self.item_list_view.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection) # Allow multi-select
+        self.item_list_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers) # Read-only view
+        self.item_list_view.setAlternatingRowColors(True) # Improves readability
+        self.item_list_view.setSortingEnabled(False) # Keep user order
+        merge_layout.addWidget(self.item_list_view, 1) # Tree view takes vertical space
+
+        # Format Selection (Merge)
+        format_merge_layout = QHBoxLayout()
+        format_merge_layout.addWidget(QLabel("Merge Format:"))
+        self.merge_format_combo = QComboBox()
+        self.merge_format_combo.setToolTip("Select the delimiter format for the merged output file.")
+        format_merge_layout.addWidget(self.merge_format_combo)
+        format_merge_layout.addStretch(1) # Push combo to the left
+        merge_layout.addLayout(format_merge_layout)
+
+        # Output File Selection (Merge)
+        output_merge_layout = QHBoxLayout()
+        self.select_output_merge_button = QPushButton("Select Output Merged File...")
+        self.select_output_merge_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.output_merge_label = QLabel("[Output file not selected]")
+        self.output_merge_label.setObjectName("OutputMergeLabel") # For styling
+        self.output_merge_label.setWordWrap(False)
+        self.output_merge_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        output_merge_layout.addWidget(self.select_output_merge_button)
+        output_merge_layout.addWidget(self.output_merge_label, 1) # Label takes remaining space
+        merge_layout.addLayout(output_merge_layout)
+
+        # Merge Action Buttons
+        merge_actions_layout = QHBoxLayout()
+        merge_actions_layout.addStretch()
+        self.merge_button = QPushButton(" Merge ")
+        self.merge_button.setObjectName("MergeButton")
+        self.merge_cancel_button = QPushButton("Cancel")
+        self.merge_cancel_button.setObjectName("MergeCancelButton")
+        self.merge_cancel_button.setEnabled(False) # Initially disabled
+        merge_actions_layout.addWidget(self.merge_button)
+        merge_actions_layout.addWidget(self.merge_cancel_button)
+        merge_actions_layout.addStretch()
+        merge_layout.addLayout(merge_actions_layout)
+
+        # --- Populate Split Tab ---
+        split_layout = QVBoxLayout(self.split_tab)
+
+        # Input File Selection (Split)
+        input_split_layout = QHBoxLayout()
+        self.select_input_split_button = QPushButton("Select Merged File to Split...")
+        self.select_input_split_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.input_split_label = QLabel("[Input file not selected]")
+        self.input_split_label.setObjectName("InputSplitLabel")
+        self.input_split_label.setWordWrap(False)
+        self.input_split_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        input_split_layout.addWidget(self.select_input_split_button)
+        input_split_layout.addWidget(self.input_split_label, 1)
+        split_layout.addLayout(input_split_layout)
+
+        # Output Directory Selection (Split)
+        output_split_layout = QHBoxLayout()
+        self.select_output_split_button = QPushButton("Select Output Folder...")
+        self.select_output_split_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.output_split_label = QLabel("[Output directory not selected]")
+        self.output_split_label.setObjectName("OutputSplitLabel")
+        self.output_split_label.setWordWrap(False)
+        self.output_split_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        output_split_layout.addWidget(self.select_output_split_button)
+        output_split_layout.addWidget(self.output_split_label, 1)
+        split_layout.addLayout(output_split_layout)
+
+        # Format Selection (Split)
+        format_split_layout = QHBoxLayout()
+        format_split_layout.addWidget(QLabel("Split Format:"))
+        self.split_format_combo = QComboBox()
+        self.split_format_combo.setToolTip("Select the delimiter format expected in the merged file.")
+        format_split_layout.addWidget(self.split_format_combo)
+        format_split_layout.addStretch(1)
+        split_layout.addLayout(format_split_layout)
+
+        # Spacer to push buttons down
+        split_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+
+        # Split Action Buttons
+        split_actions_layout = QHBoxLayout()
+        split_actions_layout.addStretch()
+        self.split_button = QPushButton(" Split ")
+        self.split_button.setObjectName("SplitButton")
+        self.split_cancel_button = QPushButton("Cancel")
+        self.split_cancel_button.setObjectName("SplitCancelButton")
+        self.split_cancel_button.setEnabled(False)
+        split_actions_layout.addWidget(self.split_button)
+        split_actions_layout.addWidget(self.split_cancel_button)
+        split_actions_layout.addStretch()
+        split_layout.addLayout(split_actions_layout)
+
+        # --- Shared Controls (Log, Progress Bar) Below Tabs ---
+        shared_controls_layout = QVBoxLayout()
+        shared_controls_layout.addWidget(QLabel("<b>Log / Status</b>"))
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth) # Wrap lines
+        self.log_text.setFixedHeight(200) # Fixed height for log area
+        shared_controls_layout.addWidget(self.log_text)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(24)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        shared_controls_layout.addWidget(self.progress_bar)
+        main_layout.addLayout(shared_controls_layout) # Add shared controls below tabs
+
+        # --- Connect Signals ---
+        self.add_files_button.clicked.connect(self.add_files)
+        self.add_folder_button.clicked.connect(self.add_folder)
+        self.remove_item_button.clicked.connect(self.remove_selected_items)
+        self.clear_list_button.clicked.connect(self.clear_item_list)
+        self.select_output_merge_button.clicked.connect(self.select_output_merge_file)
+        self.merge_button.clicked.connect(self.start_merge)
+        self.merge_cancel_button.clicked.connect(self.cancel_operation)
+        self.merge_format_combo.currentIndexChanged.connect(self._update_merge_button_state)
+        self.item_list_view.selectionModel().selectionChanged.connect(self._update_merge_button_state) # Update remove button state
+
+        self.select_input_split_button.clicked.connect(self.select_input_split_file)
+        self.select_output_split_button.clicked.connect(self.select_output_split_dir)
+        self.split_button.clicked.connect(self.start_split)
+        self.split_cancel_button.clicked.connect(self.cancel_operation)
+        self.split_format_combo.currentIndexChanged.connect(self._update_split_button_state)
+
+        # Initial state checks
+        self._update_merge_button_state()
+        self._update_split_button_state()
+
+    def apply_dark_style(self):
+        """Applies the dark mode stylesheet and Fusion style."""
+        try:
+            # Fusion style often works well with custom stylesheets
+            QApplication.setStyle(QStyleFactory.create('Fusion'))
+        except Exception as e:
+            print(f"Warning: Could not apply Fusion style: {e}")
+
+        # Apply standard icons after setting the style
+        try:
+            style = self.style() # Get the currently applied style
+            self.folder_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            self.file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+            # Get icons for buttons
+            merge_icon = style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton) # Save icon for merge
+            split_icon = style.standardIcon(QStyle.StandardPixmap.SP_ArrowRight) # Arrow for split
+            cancel_icon = style.standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton)
+            remove_icon = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon) # Trash icon for remove
+            clear_icon = style.standardIcon(QStyle.StandardPixmap.SP_DialogResetButton) # Reset/clear icon
+
+            # Set icons on buttons
+            self.add_files_button.setIcon(self.file_icon)
+            self.add_folder_button.setIcon(self.folder_icon)
+            self.remove_item_button.setIcon(remove_icon)
+            self.clear_list_button.setIcon(clear_icon)
+
+            self.merge_button.setIcon(merge_icon)
+            self.split_button.setIcon(split_icon)
+            self.merge_cancel_button.setIcon(cancel_icon)
+            self.split_cancel_button.setIcon(cancel_icon)
+
+            self.select_output_merge_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            self.select_input_split_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            self.select_output_split_button.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+
+        except Exception as e:
+            print(f"Warning: Could not load some standard icons: {e}")
+            # Application will still run, just without some icons
+
+    def _populate_format_combos(self):
+        """Populates the format combo boxes from config."""
+        self.merge_format_combo.clear()
+        self.split_format_combo.clear()
+
+        format_names = list(MERGE_FORMATS.keys())
+        if not format_names:
+            self.log("Error: No merge formats defined in config.py.")
+            self.merge_format_combo.addItem("Error: No Formats")
+            self.split_format_combo.addItem("Error: No Formats")
+            return
+
+        self.merge_format_combo.addItems(format_names)
+        self.split_format_combo.addItems(format_names)
+
+        # Optionally set a default selection
+        if "Default" in format_names:
+            self.merge_format_combo.setCurrentText("Default")
+            self.split_format_combo.setCurrentText("Default")
+        elif format_names: # Select first if Default not found
+             self.merge_format_combo.setCurrentIndex(0)
+             self.split_format_combo.setCurrentIndex(0)
+
+        # self.log(f"Populated format selectors with: {', '.join(format_names)}") # A bit verbose for startup
+
+    def log(self, message):
+        """Appends a message to the log text area."""
+        # Ensure log_text exists before appending (might be called during init)
+        if hasattr(self, 'log_text') and self.log_text:
+            self.log_text.append(message)
+            # Scroll to the bottom to show the latest message
+            self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+            QApplication.processEvents() # Update UI immediately - use sparingly
+        else:
+            print(f"LOG (pre-init): {message}") # Fallback to console
+
+    def update_progress(self, value):
+        """Updates the progress bar value."""
+        safe_value = max(0, min(value, 100)) # Clamp value between 0 and 100
+        self.progress_bar.setValue(safe_value)
+        self.progress_bar.setFormat(f"%p% ({safe_value}%)")
+
+    def operation_finished(self, success, message):
+        """Handles the completion of a worker operation."""
+        self.log(f"Operation Finished: Success={success}, Message='{message}'")
+        self.progress_bar.setValue(100) # Ensure it shows 100%
+        self.progress_bar.setFormat("Finished")
+
+        if success:
+            QMessageBox.information(self, "Operation Complete", message)
+        else:
+            # Only show warning popup if a critical error popup wasn't already shown
+            if not self._error_shown:
+                if "cancel" in message.lower():
+                    self.log("Operation was cancelled by user.")
+                    # No popup for cancellation needed, log is sufficient
+                else:
+                    # Show warning for non-critical failures reported via 'finished' signal
+                    QMessageBox.warning(self, "Operation Finished", message)
+
+        self._reset_error_flag() # Reset flag after handling finished signal
+        self._set_ui_enabled(True) # Re-enable UI
+
+        # Clean up worker and thread
+        if self.worker:
+            try: # Disconnect signals safely
+                if hasattr(self.worker, 'signals'):
+                     if hasattr(self.worker.signals, 'progress'): self.worker.signals.progress.disconnect(self.update_progress)
+                     if hasattr(self.worker.signals, 'log'): self.worker.signals.log.disconnect(self.log)
+                     if hasattr(self.worker.signals, 'error'): self.worker.signals.error.disconnect(self.operation_error)
+                     if hasattr(self.worker.signals, 'finished'): self.worker.signals.finished.disconnect(self.operation_finished)
+            except TypeError:
+                pass # Ignore if already disconnected
+            except Exception as e:
+                 self.log(f"Warning: Error disconnecting worker signals: {e}")
+            self.worker.deleteLater() # Schedule worker object deletion
+
+        if self.worker_thread:
+            if self.worker_thread.isRunning():
+                self.worker_thread.quit()
+                # Wait a bit for graceful exit, then terminate if necessary
+                if not self.worker_thread.wait(1500): # 1.5 second timeout
+                    self.log("Warning: Worker thread didn't quit gracefully. Terminating.")
+                    self.worker_thread.terminate()
+                    self.worker_thread.wait(500) # Short wait after terminate
+            self.worker_thread.deleteLater() # Schedule thread object deletion
+
+        self.worker_thread = None
+        self.worker = None
+        self.log("Worker resources released.")
+        # Update button states after cleanup and UI re-enable
+        self._update_merge_button_state()
+        self._update_split_button_state()
+
+    def operation_error(self, error_message):
+        """Slot specifically for critical errors reported by the worker's 'error' signal."""
+        self.log(f"CRITICAL ERROR received: {error_message}")
+        QMessageBox.critical(self, "Critical Operation Error", error_message)
+        self._error_shown = True # Flag that a critical error message was displayed
+
+    def _reset_error_flag(self):
+        """Reset the flag that tracks if a critical error message was shown."""
+        self._error_shown = False
+
+    def _set_ui_enabled(self, enabled):
+        """Enable/disable UI elements during processing."""
+        is_running = not enabled
+        current_index = self.tab_widget.currentIndex()
+
+        # Disable the *other* tab while an operation is running
+        self.tab_widget.setTabEnabled(1 - current_index, enabled)
+
+        # Determine active tab
+        is_merge_tab_active = (self.tab_widget.widget(current_index) == self.merge_tab)
+        is_split_tab_active = (self.tab_widget.widget(current_index) == self.split_tab)
+
+        # --- Merge Tab Controls ---
+        self.add_files_button.setEnabled(enabled)
+        self.add_folder_button.setEnabled(enabled)
+        self.remove_item_button.setEnabled(enabled and self._can_remove_merge_items()) # Also check selection
+        self.clear_list_button.setEnabled(enabled and self._can_clear_merge_items()) # Also check if list has items
+        self.item_list_view.setEnabled(enabled)
+        self.merge_format_combo.setEnabled(enabled)
+        self.select_output_merge_button.setEnabled(enabled)
+        # Enable merge button only if conditions met AND UI is enabled
+        self.merge_button.setEnabled(enabled and self._can_start_merge())
+        # Enable cancel button only if running AND on the merge tab
+        self.merge_cancel_button.setEnabled(is_running and is_merge_tab_active)
+
+        # --- Split Tab Controls ---
+        self.select_input_split_button.setEnabled(enabled)
+        self.select_output_split_button.setEnabled(enabled)
+        self.split_format_combo.setEnabled(enabled)
+        # Enable split button only if conditions met AND UI is enabled
+        self.split_button.setEnabled(enabled and self._can_start_split())
+         # Enable cancel button only if running AND on the split tab
+        self.split_cancel_button.setEnabled(is_running and is_split_tab_active)
+
+    def _can_start_merge(self):
+        """Check if conditions are met to start merging."""
+        selected_format_name = self.merge_format_combo.currentText()
+        format_ok = selected_format_name and selected_format_name in MERGE_FORMATS
+        return bool(self._items_to_merge_internal and self.output_merge_file and format_ok)
+
+    def _can_remove_merge_items(self):
+        """Check if items are present and selected in the merge list view."""
+        has_items = len(self._items_to_merge_internal) > 0
+        has_selection = len(self.item_list_view.selectedIndexes()) > 0
+        return has_items and has_selection
+
+    def _can_clear_merge_items(self):
+        """Check if items are present in the merge list."""
+        return len(self._items_to_merge_internal) > 0
+
+    def _update_merge_button_state(self):
+        """Enable/disable the Merge/Remove/Clear buttons based on state."""
+        can_merge = self._can_start_merge()
+        can_remove = self._can_remove_merge_items()
+        can_clear = self._can_clear_merge_items()
+
+        # Check if UI is currently enabled (not running an operation)
+        ui_enabled = self.merge_button.isEnabled() or not self.merge_cancel_button.isEnabled()
+
+        self.merge_button.setEnabled(ui_enabled and can_merge)
+        self.remove_item_button.setEnabled(ui_enabled and can_remove)
+        self.clear_list_button.setEnabled(ui_enabled and can_clear)
+
+
+    def _can_start_split(self):
+        """Check if conditions are met to start splitting."""
+        input_exists = os.path.isfile(self.input_split_file) # Check if file exists
+        selected_format_name = self.split_format_combo.currentText()
+        format_ok = selected_format_name and selected_format_name in MERGE_FORMATS
+        return bool(self.input_split_file and input_exists and self.output_split_dir and format_ok)
+
+    def _update_split_button_state(self):
+        """Enable/disable the Split button based on state."""
+        can_split = self._can_start_split()
+        # Check if UI is currently enabled (not running an operation)
+        ui_enabled = self.split_button.isEnabled() or not self.split_cancel_button.isEnabled()
+        self.split_button.setEnabled(ui_enabled and can_split)
+
+
+    def add_files(self):
+        """Adds selected files to the merge list and tree view."""
+        start_dir = ""
+        # Try to start dialog in the directory of the last added item
+        if self._items_to_merge_internal:
+            try:
+                # Use base path of last item for consistency
+                last_item_base_str = self._items_to_merge_internal[-1][2]
+                last_item_base = pathlib.Path(last_item_base_str)
+                if last_item_base.is_dir():
+                    start_dir = str(last_item_base)
+                elif last_item_base.parent.is_dir(): # Fallback to parent if base wasn't a dir itself
+                    start_dir = str(last_item_base.parent)
+            except Exception: # Ignore errors determining start dir
+                 pass
+
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Files to Merge", start_dir, "All Files (*.*)")
+        if files:
+            added_count = 0
+            root_node = self.item_model.invisibleRootItem()
+            # Keep track of paths added to the view in this operation to avoid duplicates in view
+            added_view_paths_this_op = set()
+            # Get set of existing worker paths for quick lookup
+            existing_worker_paths = {item[1] for item in self._items_to_merge_internal}
+
+            for file_path_str in files:
+                try:
+                    file_path = pathlib.Path(file_path_str).resolve()
+                    if not file_path.is_file():
+                        self.log(f"Warning: Selected item is not a file or does not exist: {file_path_str}")
+                        continue
+
+                    file_path_str_resolved = str(file_path)
+                    # Check if already in the internal worker list
+                    if file_path_str_resolved not in existing_worker_paths:
+                        base_path = file_path.parent.resolve()
+                        item_data_tuple = ("file", file_path_str_resolved, str(base_path))
+                        self._items_to_merge_internal.append(item_data_tuple)
+                        existing_worker_paths.add(file_path_str_resolved) # Update set
+
+                        # Add to view only if not already present at top level
+                        # Check if a top-level item with this exact path already exists
+                        already_in_view_toplevel = False
+                        for row in range(root_node.rowCount()):
+                            toplevel_item = root_node.child(row, 0)
+                            if toplevel_item and toplevel_item.data(PATH_DATA_ROLE) == file_path_str_resolved:
+                                already_in_view_toplevel = True
+                                break
+
+                        if not already_in_view_toplevel and file_path_str_resolved not in added_view_paths_this_op:
+                            item = QStandardItem(self.file_icon, file_path.name)
+                            item.setToolTip(f"File: {file_path}\nBase: {base_path}")
+                            item.setData(item_data_tuple[0], TYPE_DATA_ROLE)
+                            item.setData(item_data_tuple[1], PATH_DATA_ROLE)
+                            item.setData(item_data_tuple[2], BASE_PATH_DATA_ROLE)
+                            item.setEditable(False)
+                            root_node.appendRow(item)
+                            added_view_paths_this_op.add(file_path_str_resolved)
+
+                        added_count += 1
+                    # else: # Be less verbose, don't log every skipped file
+                    #     self.log(f"Skipping already added file: {file_path.name}")
+
+                except OSError as e:
+                    self.log(f"Error resolving path '{file_path_str}': {e}")
+                except Exception as e:
+                    self.log(f"Unexpected error adding file '{file_path_str}': {e}")
+
+            if added_count > 0:
+                self.log(f"Added {added_count} unique file(s) to the merge list.")
+                self._update_merge_button_state()
+            elif files:
+                self.log("Selected file(s) were already in the list.")
+
+    def add_folder(self):
+        """Opens the FolderSelectionDialog and adds selected items."""
+        start_dir = ""
+        if self._items_to_merge_internal:
+            try:
+                last_item_base = pathlib.Path(self._items_to_merge_internal[-1][2])
+                if last_item_base.is_dir(): start_dir = str(last_item_base)
+                elif last_item_base.parent.is_dir(): start_dir = str(last_item_base.parent)
+            except Exception: pass
+
+        folder_path_str = QFileDialog.getExistingDirectory(self, "Select Folder to Scan", start_dir)
+        if folder_path_str:
+            try:
+                folder_path = pathlib.Path(folder_path_str).resolve()
+                if not folder_path.is_dir():
+                    QMessageBox.warning(self, "Invalid Folder", f"Not a valid directory:\n{folder_path_str}")
+                    return
+
+                # --- Use FolderSelectionDialog ---
+                dialog = FolderSelectionDialog(str(folder_path), self)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    selected_items_for_worker = dialog.get_selected_items()
+
+                    if not selected_items_for_worker:
+                        self.log(f"No items selected from folder: {folder_path.name}")
+                        return
+
+                    added_count_worker = 0
+                    added_count_view = 0
+                    items_already_present_paths = {item[1] for item in self._items_to_merge_internal}
+                    new_items_for_worker = []
+
+                    # Add selected items to internal list if not already present
+                    for item_tuple in selected_items_for_worker:
+                        item_abs_path = item_tuple[1]
+                        if item_abs_path not in items_already_present_paths:
+                            new_items_for_worker.append(item_tuple)
+                            items_already_present_paths.add(item_abs_path) # Update set
+                            added_count_worker += 1
+
+                    self._items_to_merge_internal.extend(new_items_for_worker)
+
+                    # Add/Update a single entry in the TreeView representing the folder source
+                    root_node = self.item_model.invisibleRootItem()
+                    folder_root_path_str = str(folder_path)
+                    existing_folder_root_item = None
+
+                    # Find if a representation for this folder already exists
+                    for row in range(root_node.rowCount()):
+                        item = root_node.child(row, 0)
+                        if item and item.data(TYPE_DATA_ROLE) == "folder-root" and item.data(PATH_DATA_ROLE) == folder_root_path_str:
+                            existing_folder_root_item = item
+                            break
+
+                    num_selected = len(selected_items_for_worker)
+                    display_text = f"{folder_path.name} ({num_selected} selected)"
+                    tooltip_text = f"Folder Source: {folder_root_path_str}\nSelected {num_selected} item(s) within."
+                    # Get base path from the dialog results (should be consistent)
+                    base_path_from_dialog = selected_items_for_worker[0][2] if selected_items_for_worker else ""
+
+                    if not existing_folder_root_item:
+                        folder_item = QStandardItem(self.folder_icon, display_text)
+                        folder_item.setToolTip(tooltip_text)
+                        folder_item.setData("folder-root", TYPE_DATA_ROLE) # Special type for view item
+                        folder_item.setData(folder_root_path_str, PATH_DATA_ROLE)
+                        folder_item.setData(base_path_from_dialog, BASE_PATH_DATA_ROLE)
+                        folder_item.setEditable(False)
+                        root_node.appendRow(folder_item)
+                        added_count_view += 1
+                    else:
+                        # Update existing item text and tooltip
+                        existing_folder_root_item.setText(display_text)
+                        existing_folder_root_item.setToolTip(tooltip_text + " (updated)")
+                        # Ensure base path is updated if it somehow changed (unlikely here)
+                        existing_folder_root_item.setData(base_path_from_dialog, BASE_PATH_DATA_ROLE)
+                        # self.log(f"Note: Selection from folder '{folder_path.name}' updated.")
+
+                    # Log results
+                    if added_count_worker > 0:
+                        self.log(f"Added {added_count_worker} new item(s) from folder '{folder_path.name}' to merge list.")
+                    elif selected_items_for_worker: # Items selected, but none were new
+                         self.log(f"Selection from folder '{folder_path.name}' updated. No *new* items added (already present or re-selected).")
+
+                    # if added_count_view > 0: # Less important log message
+                    #     self.log(f"Added representation for folder '{folder_path.name}' to the view.")
+
+                    self._update_merge_button_state()
+
+                else: # Dialog was cancelled
+                    self.log(f"Folder selection cancelled for: {folder_path.name}")
+
+            except OSError as e:
+                err_msg = f"Error resolving folder path '{folder_path_str}': {e}"
+                self.log(err_msg)
+                QMessageBox.critical(self, "Error", f"Could not access or resolve folder:\n{folder_path_str}\n\nError: {e}")
+            except Exception as e:
+                err_msg = f"Unexpected error adding folder '{folder_path_str}': {e}\n{traceback.format_exc()}"
+                self.log(err_msg)
+                QMessageBox.critical(self, "Error", f"An unexpected error occurred adding folder:\n{e}")
+
+
+    def remove_selected_items(self):
+        """Removes selected items from the tree view AND the internal worker list."""
+        selected_indexes = self.item_list_view.selectedIndexes()
+        if not selected_indexes:
+            # self.log("No item(s) selected to remove.") # Too noisy
+            return
+
+        # --- Identify what to remove ---
+        items_to_remove_from_view = set() # Store QStandardItem objects
+        paths_to_remove_from_worker = set() # Store absolute path strings
+
+        for index in selected_indexes:
+            # Ensure we process each item only once, using the first column index
+            if not index.isValid() or index.column() != 0:
+                continue
+
+            item = self.item_model.itemFromIndex(index)
+            if item and item not in items_to_remove_from_view:
+                items_to_remove_from_view.add(item)
+                item_path = item.data(PATH_DATA_ROLE)
+                item_type = item.data(TYPE_DATA_ROLE)
+
+                if not item_path: continue # Should not happen
+
+                # If removing a "folder-root" view item, remove ALL worker items associated with it
+                if item_type == "folder-root":
+                    folder_root_path_str = item_path
+                    folder_root_base_path = item.data(BASE_PATH_DATA_ROLE)
+                    # Find all worker items that originated from this folder selection
+                    # Match based on base_path and path prefix
+                    count_found = 0
+                    for worker_tuple in self._items_to_merge_internal:
+                        worker_type, worker_path, worker_base = worker_tuple
+                        # Check if base path matches AND the item path starts with the folder root path
+                        # Need path normalization here potentially if symlinks involved, but basic check for now:
+                        is_match = False
+                        try:
+                             # Convert to Path objects for comparison
+                             p_worker = pathlib.Path(worker_path)
+                             p_root = pathlib.Path(folder_root_path_str)
+                             # Check if worker path is the root itself or inside the root
+                             if worker_base == folder_root_base_path and (p_worker == p_root or p_root in p_worker.parents):
+                                 is_match = True
+                        except Exception as path_err:
+                             self.log(f"Warning: Path comparison error during removal check: {path_err}")
+                             # Fallback to string comparison (less reliable)
+                             if worker_base == folder_root_base_path and worker_path.startswith(folder_root_path_str):
+                                 is_match = True
+
+                        if is_match:
+                            paths_to_remove_from_worker.add(worker_path)
+                            count_found += 1
+                    # self.log(f"Marked {count_found} worker items for removal based on folder '{item.text()}'.")
+
+                # If removing a top-level file item, just remove that specific path
+                elif item_type == "file":
+                    paths_to_remove_from_worker.add(item_path)
+
+        # --- Perform Removal ---
+        initial_worker_count = len(self._items_to_merge_internal)
+        if paths_to_remove_from_worker:
+            self._items_to_merge_internal = [
+                item_tuple for item_tuple in self._items_to_merge_internal
+                if item_tuple[1] not in paths_to_remove_from_worker
+            ]
+        removed_count_worker = initial_worker_count - len(self._items_to_merge_internal)
+
+        # Remove from view model (more complex due to tree structure)
+        # Group rows to remove by parent to do it efficiently
+        removal_map = {} # {parent_item: [row_indices]}
+        for item in items_to_remove_from_view:
+            parent = item.parent() or self.item_model.invisibleRootItem()
+            row = item.row()
+            if parent not in removal_map:
+                removal_map[parent] = []
+            removal_map[parent].append(row)
+
+        removed_count_display = 0
+        self.item_model.blockSignals(True) # Block signals during batch removal
+        try:
+            # Remove rows in reverse order for each parent to avoid index shifting issues
+            for parent, rows in removal_map.items():
+                for row in sorted(rows, reverse=True):
+                    # Check if removal succeeded (parent might have been removed already if nested selection)
+                    if parent.isValid() and parent.child(row,0): # Check child exists before removal
+                        if parent.removeRow(row):
+                             removed_count_display += 1
+                        else:
+                             # This might happen if the view is out of sync, log it.
+                             self.log(f"Warning: Failed to remove row {row} from view model parent '{parent.text() if parent.isValid() else 'root'}'.")
+        finally:
+            self.item_model.blockSignals(False) # Re-enable signals
+
+        if removed_count_display > 0 or removed_count_worker > 0:
+            self.log(f"Removed {removed_count_display} item(s) from view and {removed_count_worker} corresponding item(s) from merge list.")
+        # else: # Less verbose
+        #     self.log("No corresponding items found to remove or removal failed.")
+
+        self._update_merge_button_state() # Update button states
+
+
+    def clear_item_list(self):
+        """Clears both the view model and the internal worker list."""
+        if not self._items_to_merge_internal and self.item_model.rowCount() == 0:
+            self.log("List is already empty.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Clear",
+                                     "Remove ALL items from the merge list?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No) # Default to No
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.item_model.clear() # Clear the tree view
+            self._items_to_merge_internal.clear() # Clear the internal data list
+            self.log("Cleared merge item list.")
+            self._update_merge_button_state() # Update button states
+        else:
+            self.log("Clear operation cancelled.")
+
+
+    def select_output_merge_file(self):
+        """Selects the output .txt file for merging."""
+        start_dir = os.path.dirname(self.output_merge_file) if self.output_merge_file else QDir.currentPath()
+        # Suggest a default filename
+        suggested_filename = os.path.join(start_dir, "merged_output.txt")
+
+        file_path, file_filter = QFileDialog.getSaveFileName(
+            self, "Save Merged File As", suggested_filename,
+            "Text Files (*.txt);;All Files (*)") # Allow all files but default to txt
+
+        if file_path:
+            p = pathlib.Path(file_path)
+            # Add .txt extension if user selected the filter and didn't type one
+            if file_filter == "Text Files (*.txt)" and not p.suffix:
+                file_path += ".txt"
+                p = pathlib.Path(file_path)
+
+            self.output_merge_file = str(p.resolve()) # Store resolved path
+            display_path = self._truncate_path_display(self.output_merge_file)
+            self.output_merge_label.setText(display_path)
+            self.output_merge_label.setToolTip(self.output_merge_file) # Full path in tooltip
+            self.log(f"Selected merge output file: {self.output_merge_file}")
+            self._update_merge_button_state()
+
+
+    def select_input_split_file(self):
+        """Selects the input .txt file for splitting."""
+        start_dir = os.path.dirname(self.input_split_file) if self.input_split_file else QDir.currentPath()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Merged File to Split", start_dir,
+            "Text Files (*.txt);;All Files (*)")
+
+        if file_path:
+            p = pathlib.Path(file_path)
+            self.input_split_file = str(p.resolve())
+            display_path = self._truncate_path_display(self.input_split_file)
+            self.input_split_label.setText(display_path)
+            self.input_split_label.setToolTip(self.input_split_file)
+            self.log(f"Selected split input file: {self.input_split_file}")
+            self._update_split_button_state()
+
+
+    def select_output_split_dir(self):
+        """Selects the output directory for split files."""
+        start_dir = self.output_split_dir if self.output_split_dir else QDir.currentPath()
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory for Split Files", start_dir)
+
+        if dir_path:
+            p = pathlib.Path(dir_path)
+            self.output_split_dir = str(p.resolve())
+            display_path = self._truncate_path_display(self.output_split_dir)
+            self.output_split_label.setText(display_path)
+            self.output_split_label.setToolTip(self.output_split_dir)
+            self.log(f"Selected split output directory: {self.output_split_dir}")
+            self._update_split_button_state()
+
+
+    def _truncate_path_display(self, path_str, max_len=60):
+        """Truncates a path string for display in labels, adding ellipsis."""
+        if len(path_str) <= max_len:
+            return path_str
+        else:
+            # Try to show ".../grandparent/parent/filename"
+            try:
+                parts = pathlib.Path(path_str).parts
+                if len(parts) > 2:
+                    # Show last two parts
+                    truncated = f"...{os.sep}{parts[-2]}{os.sep}{parts[-1]}"
+                    # If still too long, show only last part
+                    if len(truncated) > max_len:
+                        truncated = f"...{os.sep}{parts[-1]}"
+                    # If *still* too long, truncate the filename itself
+                    if len(truncated) > max_len:
+                        truncated = "..." + parts[-1][-(max_len-4):]
+                    return truncated
+                elif len(parts) == 2: # e.g., C:\file.txt -> C:\.../file.txt
+                    return f"{parts[0]}{os.sep}...{os.sep}{parts[-1]}"
+                else: # Just a filename, unlikely but possible
+                    return path_str[:max_len-3] + "..."
+            except Exception: # Pathlib errors, fallback
+                 return path_str[:max_len-3] + "..."
+
+    def _create_output_dir_if_needed(self, dir_path_str, operation_name):
+        """Checks if a directory exists and is writable, prompts to create if not.
+           Returns True if directory is ready, False otherwise."""
+        if not dir_path_str:
+            self.log(f"Error: Output directory path is empty for {operation_name}.")
+            QMessageBox.critical(self, f"{operation_name} Error", "Output directory path is not set.")
+            return False
+        try:
+            dir_path = pathlib.Path(dir_path_str)
+
+            if not dir_path.exists():
+                reply = QMessageBox.question(
+                    self, f"Create Directory?",
+                    f"Output directory does not exist:\n{dir_path}\n\nCreate it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)
+                if reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        dir_path.mkdir(parents=True, exist_ok=True)
+                        self.log(f"Created output directory: {dir_path}")
+                        # Check write permissions after creation
+                        if not os.access(str(dir_path), os.W_OK):
+                            raise OSError("Directory created but is not writable.")
+                        return True # Created and writable
+                    except OSError as e:
+                        QMessageBox.critical(
+                            self, f"{operation_name} Error",
+                            f"Could not create or write to directory:\n{dir_path}\n\nError: {e}")
+                        self.log(f"Error: Failed create/write directory: {e}")
+                        return False # Failed creation or writing
+                else:
+                    self.log(f"{operation_name} cancelled (output directory not created).")
+                    return False # User chose not to create
+
+            elif not dir_path.is_dir():
+                QMessageBox.critical(
+                    self, f"{operation_name} Error",
+                    f"Output path exists but is not a directory:\n{dir_path}")
+                self.log(f"Error: Output path is not a directory: {dir_path}")
+                return False # Path exists but isn't a directory
+
+            elif not os.access(str(dir_path), os.W_OK):
+                QMessageBox.critical(
+                    self, f"{operation_name} Error",
+                    f"Output directory is not writable:\n{dir_path}")
+                self.log(f"Error: Output directory not writable: {dir_path}")
+                return False # Directory exists but isn't writable
+
+            else:
+                # Directory exists, is a directory, and is writable
+                return True
+
+        except Exception as e: # Catch potential Path errors for invalid strings
+            QMessageBox.critical(
+                self, f"{operation_name} Error",
+                f"Invalid output directory path specified:\n{dir_path_str}\n\nError: {e}")
+            self.log(f"Error: Invalid output path '{dir_path_str}': {e}")
+            return False
+
+    def start_merge(self):
+        """Starts the merge operation in a background thread using the selected format."""
+        if not self._can_start_merge():
+            # Provide specific feedback
+            msg = "Cannot start merge. Please ensure:"
+            if not self._items_to_merge_internal: msg += "\n- Items have been added to the list."
+            if not self.output_merge_file: msg += "\n- An output file has been selected."
+            if not self.merge_format_combo.currentText() or self.merge_format_combo.currentText() not in MERGE_FORMATS:
+                 msg += "\n- A valid merge format is selected."
+            QMessageBox.warning(self, "Merge Error", msg)
+            self.log(f"Merge aborted: Conditions not met. Reason: {msg.replace(':',' -').replace('\n- ',' ')}")
+            return
+
+        # Check/Create output directory *before* starting worker
+        output_dir = os.path.dirname(self.output_merge_file)
+        if not self._create_output_dir_if_needed(output_dir, "Merge"):
+            self.log("Merge aborted: Output directory check/creation failed.")
+            return
+
+        # Prevent starting if already running
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "Another operation is already in progress.")
+            self.log("Merge aborted: Another worker is active.")
+            return
+
+        # --- Get Selected Format Details ---
+        selected_format_name = self.merge_format_combo.currentText()
+        selected_format_details = MERGE_FORMATS.get(selected_format_name)
+        # This check should be redundant due to _can_start_merge, but good practice
+        if not selected_format_details:
+            QMessageBox.critical(self, "Internal Error", f"Selected merge format '{selected_format_name}' not found in configuration.")
+            self.log(f"CRITICAL Error: Cannot find details for merge format '{selected_format_name}'.")
+            return
+
+        # --- Prepare and Start Worker ---
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting Merge...")
+        self._set_ui_enabled(False)
+        self._reset_error_flag()
+
+        # Pass a copy of the list to the worker
+        worker_data = list(self._items_to_merge_internal)
+        self.log(f"Starting merge with {len(worker_data)} items/sources using format '{selected_format_name}'.")
+        self.log(f"Output file: {self.output_merge_file}")
+
+        self.worker_thread = QThread(self)
+        self.worker = MergerWorker(worker_data, self.output_merge_file, selected_format_details)
+        self.worker.moveToThread(self.worker_thread)
+
+        # Connect worker signals to UI slots
+        self.worker.signals.progress.connect(self.update_progress)
+        self.worker.signals.log.connect(self.log)
+        self.worker.signals.error.connect(self.operation_error)
+        self.worker.signals.finished.connect(self.operation_finished)
+
+        # Connect thread signals for cleanup
+        self.worker_thread.finished.connect(self.worker.deleteLater) # Schedule worker deletion when thread finishes
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater) # Schedule thread deletion
+
+        # Start the worker's run method when the thread starts
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker_thread.start()
+        self.log("Merge worker thread started.")
+
+
+    def start_split(self):
+        """Starts the split operation in a background thread using the selected format."""
+        if not self._can_start_split():
+            msg = "Cannot start split. Please ensure:"
+            if not self.input_split_file or not os.path.isfile(self.input_split_file): msg += "\n- A valid input file has been selected."
+            if not self.output_split_dir: msg += "\n- An output directory has been selected."
+            if not self.split_format_combo.currentText() or self.split_format_combo.currentText() not in MERGE_FORMATS:
+                msg += "\n- A valid split format is selected."
+            QMessageBox.warning(self, "Split Error", msg)
+            self.log(f"Split aborted: Conditions not met. Reason: {msg.replace(':',' -').replace('\n- ',' ')}")
+            return
+
+        # Check/Create output directory *before* starting worker
+        if not self._create_output_dir_if_needed(self.output_split_dir, "Split"):
+            self.log("Split aborted: Output directory check/creation failed.")
+            return
+
+        # Prevent starting if already running
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "Another operation is already in progress.")
+            self.log("Split aborted: Another worker is active.")
+            return
+
+        # --- Get Selected Format Details ---
+        selected_format_name = self.split_format_combo.currentText()
+        selected_format_details = MERGE_FORMATS.get(selected_format_name)
+        if not selected_format_details:
+            QMessageBox.critical(self, "Internal Error", f"Selected split format '{selected_format_name}' not found in configuration.")
+            self.log(f"CRITICAL Error: Cannot find details for split format '{selected_format_name}'.")
+            return
+
+        # --- Prepare and Start Worker ---
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting Split...")
+        self._set_ui_enabled(False)
+        self._reset_error_flag()
+        self.log(f"Starting split: '{os.path.basename(self.input_split_file)}' -> '{self.output_split_dir}'")
+        self.log(f"Using format: '{selected_format_name}'")
+
+        self.worker_thread = QThread(self)
+        self.worker = SplitterWorker(self.input_split_file, self.output_split_dir, selected_format_details)
+        self.worker.moveToThread(self.worker_thread)
+
+        # Connect signals
+        self.worker.signals.progress.connect(self.update_progress)
+        self.worker.signals.log.connect(self.log)
+        self.worker.signals.error.connect(self.operation_error)
+        self.worker.signals.finished.connect(self.operation_finished)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.started.connect(self.worker.run)
+
+        self.worker_thread.start()
+        self.log("Split worker thread started.")
+
+
+    def cancel_operation(self):
+        """Signals the running worker thread to stop."""
+        if self.worker and self.worker_thread and self.worker_thread.isRunning():
+            self.log("Attempting to cancel running operation...")
+            try:
+                # Call the worker's stop method
+                self.worker.stop()
+            except Exception as e:
+                # Log error but don't crash UI
+                self.log(f"Error trying to signal worker to stop: {e}")
+
+            # Disable cancel buttons immediately to prevent multiple clicks
+            self.merge_cancel_button.setEnabled(False)
+            self.split_cancel_button.setEnabled(False)
+            self.progress_bar.setFormat("Cancelling...")
+            # The operation_finished slot will handle actual UI re-enabling and cleanup
+        else:
+            self.log("No operation is currently running to cancel.")
+
+
+    def closeEvent(self, event):
+        """Ensure worker thread is stopped cleanly on application close."""
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.log("Close Event: Attempting to stop active operation...")
+            self.cancel_operation() # Signal worker to stop
+
+            # Give the thread some time to finish based on the worker's stop flag
+            if not self.worker_thread.wait(2500): # Wait 2.5 seconds
+                self.log("Warning: Worker thread did not terminate gracefully after cancel signal. Forcing termination.")
+                self.worker_thread.terminate() # Force stop if needed
+                self.worker_thread.wait(500) # Brief wait after terminate
+            else:
+                self.log("Worker thread stopped successfully during close event.")
+        event.accept() # Proceed with closing the window
