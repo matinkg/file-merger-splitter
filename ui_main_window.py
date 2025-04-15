@@ -680,111 +680,148 @@ class MergerSplitterApp(QWidget):
         """Removes selected items from the tree view AND the internal worker list."""
         selected_indexes = self.item_list_view.selectedIndexes()
         if not selected_indexes:
-            # self.log("No item(s) selected to remove.") # Too noisy
+            # Nothing selected, nothing to do.
             return
 
-        # --- Identify what to remove ---
-        items_to_remove_from_view = set() # Store QStandardItem objects
-        paths_to_remove_from_worker = set() # Store absolute path strings
+        unique_top_level_rows_to_remove = set()
+        paths_to_remove_from_worker = set()
+        items_processed_for_worker_paths = set() # Track rows processed for worker path collection
 
+        # --- Step 1 & 2: Identify unique top-level rows and map to worker paths ---
         for index in selected_indexes:
-            # Ensure we process each item only once, using the first column index
+            # We only care about column 0 selections for identifying the item/row
             if not index.isValid() or index.column() != 0:
                 continue
 
-            item = self.item_model.itemFromIndex(index)
-            if item and item not in items_to_remove_from_view:
-                items_to_remove_from_view.add(item)
-                item_path = item.data(PATH_DATA_ROLE)
-                item_type = item.data(TYPE_DATA_ROLE)
-                item_base = item.data(BASE_PATH_DATA_ROLE) # Get base path from view item
+            # For the current flat view, the selected index IS the top-level index.
+            top_level_row = index.row()
+            if top_level_row < 0: # Should not happen for valid selections from the view
+                continue
 
-                if not item_path:
-                    continue # Should not happen
+            # Add the row index to the set for view removal
+            unique_top_level_rows_to_remove.add(top_level_row)
 
-                # If removing a "folder-root" view item, remove ALL worker items associated with it
-                if item_type == "folder-root":
-                    folder_root_path_str = item_path
-                    # Use the base path stored in the view item for matching worker items
-                    folder_root_base_path = item_base
-                    if not folder_root_base_path:
-                        self.log(f"Warning: Missing base path for folder item '{item.text()}'. Cannot reliably remove worker items.")
-                        continue
+            # Check if we already processed this row for worker path collection
+            if top_level_row in items_processed_for_worker_paths:
+                continue
+            items_processed_for_worker_paths.add(top_level_row)
 
-                    # Find all worker items that originated from this folder selection
-                    # Match based on BASE_PATH and ensure worker path is within the folder_root path
-                    count_found = 0
-                    for worker_tuple in self._items_to_merge_internal:
-                        worker_type, worker_path, worker_base = worker_tuple
-                        is_match = False
-                        if worker_base == folder_root_base_path:
+            # Get the item for this top-level row from the model
+            item = self.item_model.item(top_level_row, 0)
+            if not item:
+                self.log(f"Warning: Could not retrieve item for top-level row {top_level_row}. Skipping worker path collection for this row.")
+                continue
+
+            # Retrieve data stored in the item
+            item_path = item.data(PATH_DATA_ROLE)
+            item_type = item.data(TYPE_DATA_ROLE)
+            item_base = item.data(BASE_PATH_DATA_ROLE)
+
+            if not item_path:
+                self.log(f"Warning: Item '{item.text()}' at row {top_level_row} has no path data.")
+                continue
+
+            # Collect worker paths based on the type of the view item
+            if item_type == "file":
+                paths_to_remove_from_worker.add(item_path)
+            elif item_type == "folder-root":
+                folder_root_path_str = item_path
+                folder_root_base_path = item_base
+                if not folder_root_base_path:
+                    self.log(f"Warning: Missing base path for folder item '{item.text()}'. Cannot reliably remove worker items.")
+                    continue
+
+                # Find worker items matching this folder selection based on base path and containment
+                items_to_mark = set()
+                for worker_tuple in self._items_to_merge_internal:
+                    _w_type, w_path, w_base = worker_tuple
+                    is_match = False
+                    # Match based on the base path associated with the folder-root item in the view
+                    if w_base == folder_root_base_path:
+                        # Use robust path matching logic
+                        try:
+                            p_worker = pathlib.Path(w_path).resolve()
+                            p_root = pathlib.Path(folder_root_path_str).resolve()
+                            # Check if the worker path is the root itself or is contained within it
+                            if p_worker == p_root or p_root in p_worker.parents:
+                                is_match = True
+                        except Exception as path_err:
+                            self.log(f"Warning: Path comparison error during removal check for folder '{folder_root_path_str}': {path_err}")
+                            # Fallback string check (less reliable for edge cases)
                             try:
-                                # Convert to Path objects for robust comparison
-                                p_worker = pathlib.Path(worker_path).resolve()
-                                p_root = pathlib.Path(folder_root_path_str).resolve()
-                                # Check if worker path is the root itself or inside the root
-                                if p_worker == p_root or p_root in p_worker.parents:
+                                # Ensure path is valid before string check
+                                if pathlib.Path(folder_root_path_str).is_dir() and w_path.startswith(folder_root_path_str):
                                     is_match = True
-                            except Exception as path_err:
-                                self.log(f"Warning: Path comparison error during removal check for folder '{folder_root_path_str}': {path_err}")
-                                # Less reliable fallback: string comparison
-                                if worker_path.startswith(folder_root_path_str):
-                                    is_match = True
+                            except OSError: # Handle invalid path strings gracefully
+                                pass
+                    if is_match:
+                        items_to_mark.add(w_path)
+                paths_to_remove_from_worker.update(items_to_mark)
+            # else: Ignore other potential item types if any exist
 
-                        if is_match:
-                            paths_to_remove_from_worker.add(worker_path)
-                            count_found += 1
-                    # self.log(f"Marked {count_found} worker items for removal based on folder '{item.text()}'.")
+        # --- Step 3: Clear Selection in the View ---
+        # Crucial step: Clear the view's selection *before* modifying the model rows
+        # This helps prevent issues where the view's selection state interferes with removal.
+        if unique_top_level_rows_to_remove: # Only clear if we identified rows to remove
+            self.item_list_view.clearSelection()
+            # Optional: Force event processing if needed, but usually not necessary here.
+            # QApplication.processEvents()
 
-                # If removing a top-level file item, just remove that specific path
-                elif item_type == "file":
-                    paths_to_remove_from_worker.add(item_path)
-
-        # --- Perform Removal ---
+        # --- Step 4: Remove Worker Data ---
         initial_worker_count = len(self._items_to_merge_internal)
+        removed_count_worker = 0
         if paths_to_remove_from_worker:
+            # Create the new list, filtering out items whose path is in the removal set
             self._items_to_merge_internal = [
                  item_tuple for item_tuple in self._items_to_merge_internal
                  if item_tuple[1] not in paths_to_remove_from_worker
             ]
-        removed_count_worker = initial_worker_count - len(self._items_to_merge_internal)
+            removed_count_worker = initial_worker_count - len(self._items_to_merge_internal)
 
-        # Remove from view model (more complex due to tree structure)
-        # Group rows to remove by parent to do it efficiently
-        removal_map = {} # {parent_item: [row_indices]}
-        for item in items_to_remove_from_view:
-            parent = item.parent() or self.item_model.invisibleRootItem()
-            row = item.row()
-            if parent not in removal_map:
-                removal_map[parent] = []
-            removal_map[parent].append(row)
-
+        # --- Step 5: Remove View Rows ---
         removed_count_display = 0
-        # Block signals during batch removal
-        self.item_model.blockSignals(True)
-        try:
-            # Remove rows in reverse order for each parent to avoid index shifting issues
-            for parent, rows in removal_map.items():
-                 # Check if parent itself is still valid (might have been removed if nested selection)
-                 parent_index = self.item_model.indexFromItem(parent) if parent != self.item_model.invisibleRootItem() else QModelIndex()
-                 if parent == self.item_model.invisibleRootItem() or parent_index.isValid():
-                    for row in sorted(rows, reverse=True):
-                        # Check if child exists at row before removal
-                        if parent.child(row, 0):
-                            if parent.removeRow(row):
-                                removed_count_display += 1
-                            else:
-                                self.log(f"Warning: Failed to remove row {row} from view model parent '{parent.text() if parent.isValid() else 'root'}'.")
-        finally:
-            self.item_model.blockSignals(False) # Re-enable signals
+        if unique_top_level_rows_to_remove:
+            # Block signals for potentially faster batch removal, though less critical for small removals
+            self.item_model.blockSignals(True)
+            try:
+                # Parent index for top-level items is the invalid index (represents the root)
+                root_parent_index = QModelIndex()
+                # Remove rows in descending order to avoid index shifting issues during removal
+                sorted_rows = sorted(list(unique_top_level_rows_to_remove), reverse=True)
 
+                for row in sorted_rows:
+                    # Check bounds *before* attempting removal using the model's current state
+                    current_root_row_count = self.item_model.rowCount(root_parent_index)
+                    if 0 <= row < current_root_row_count:
+                        # Use the model's removeRow method directly for top-level rows
+                        removed_ok = self.item_model.removeRow(row, root_parent_index)
+                        if removed_ok:
+                            removed_count_display += 1
+                        else:
+                            # Log if the model explicitly failed the removal
+                            self.log(f"Warning: model.removeRow({row}, root_parent) returned False.")
+                    else:
+                         # Log if the index is out of bounds, which might indicate an unexpected model state
+                         # Avoid logging if list was already empty (count == 0)
+                         if current_root_row_count > 0:
+                              self.log(f"Warning: Row index {row} was out of bounds for root parent during removal (current row count: {current_root_row_count}).")
+
+            except Exception as e_view_remove:
+                # Log any unexpected exceptions during the view removal process
+                self.log(f"ERROR: Exception during view removal: {e_view_remove}\n{traceback.format_exc()}")
+            finally:
+                # IMPORTANT: Always re-enable signals, even if errors occurred
+                self.item_model.blockSignals(False)
+
+        # --- Final Logging and State Update ---
         if removed_count_display > 0 or removed_count_worker > 0:
             self.log(f"Removed {removed_count_display} item(s) from view and {removed_count_worker} corresponding item(s) from merge list.")
-        # else: # Less verbose
-        #     self.log("No corresponding items found to remove or removal failed.")
+        # Optional: Add a log if items were selected but nothing was ultimately removed
+        # elif selected_indexes:
+        #     self.log("Selected items processed, but no corresponding items were removed.")
 
-        self._update_merge_button_state() # Update button states
-
+        # Update button states (e.g., disable 'Remove' if list becomes empty)
+        self._update_merge_button_state()
 
     def clear_item_list(self):
         """Clears both the view model and the internal worker list."""
