@@ -1,2 +1,24 @@
-.venv
-__pycache__
+# Virtual Environment
+.venv/
+venv/
+env/
+*.venv
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller generated files/folders
+build/
+dist/
+
+# OS-specific files (Optional but good practice)
+.DS_Store
+Thumbs.db
+
+# IDE/Editor specific files (Optional)
+.vscode/
+.idea/
+*.swp
+*~
