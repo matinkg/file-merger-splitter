@@ -45,7 +45,7 @@ class MergerSplitterApp(QWidget):
 
     def initUI(self):
         self.setObjectName("MergerSplitterAppWindow")  # For styling hook
-        self.setWindowTitle('File Merger & Splitter (Multi-Format)')
+        self.setWindowTitle('File Merger & Splitter')
         self.setGeometry(150, 150, 850, 800)  # Initial size and position
 
         main_layout = QVBoxLayout(self)
