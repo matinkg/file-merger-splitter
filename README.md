@@ -1,8 +1,10 @@
-# File Merger & Splitter (Multi-Format)
+# File Merger & Splitter
 
 ![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)
 ![PyQt Version](https://img.shields.io/badge/PyQt-6-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+
+![Screenshot](screenshot.png)
 
 A graphical desktop utility (built with Python and PyQt6) to easily merge multiple files and entire directory structures into a single text file, and later split that merged file back into its original components.
 
@@ -36,19 +38,6 @@ Simply merge your project, copy the content of the resulting `merged_output.txt`
 *   **Cross-Platform:** Should work on Windows, macOS, and Linux (wherever Python and PyQt6 are supported).
 *   **Dark Theme:** Uses the Fusion style for better compatibility with dark system themes.
 
-## Screenshots
-
-*(Add screenshots here after running the application)*
-
-**Merge Tab:**
-`[Screenshot of the Merge Tab showing files added and options]`
-
-**Split Tab:**
-`[Screenshot of the Split Tab showing input/output selected]`
-
-**Folder Selection Dialog:**
-`[Screenshot of the Folder Selection Tree View Dialog]`
-
 ## Usage
 
 ### Merging Files/Folders
@@ -74,50 +63,6 @@ Simply merge your project, copy the content of the resulting `merged_output.txt`
 4.  Select the **"Split Format"** from the dropdown. **Crucially, this must match the format used when the file was merged.**
 5.  Click the **"Split"** button.
 6.  Wait for the progress bar and log to indicate completion. The original file structure will be recreated in the selected output folder.
-
-## Merge Formats
-
-The application supports different ways to structure the merged file using delimiters:
-
-*   **Default:** Uses simple text delimiters. Good for raw processing.
-    ```
-    --- START FILE: path/to/your/file.py ---
-    # Content of file.py goes here...
-    print("Hello")
-    --- END FILE: path/to/your/file.py ---
-
-    --- START FILE: another/file.txt ---
-    Some text content.
-    --- END FILE: another/file.txt ---
-    ```
-*   **Markdown:** Uses Markdown headers and fenced code blocks. Renders nicely on platforms like GitHub.
-    ```markdown
-    File: `path/to/your/file.py`
-
-    ```
-    # Content of file.py goes here...
-    print("Hello")
-    ```
-
-    File: `another/file.txt`
-
-    ```
-    Some text content.
-    ```
-    ```
-*   **Markdown (Fenced):** Uses Markdown fenced code blocks where the file path is part of the opening fence (info string). Common in many AI contexts.
-    ```markdown
-    ```path/to/your/file.py
-    # Content of file.py goes here...
-    print("Hello")
-    ```
-
-    ```another/file.txt
-    Some text content.
-    ```
-    ```
-
-Choose the format that best suits your needs or the requirements of the system/LLM you are providing the merged file to.
 
 ## Building from Source
 
