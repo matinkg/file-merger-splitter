@@ -51,7 +51,6 @@ MERGE_FORMATS = {
         "content_suffix": "",
         # --- Splitter settings ---
         # Regex: Match ``` followed by the filepath, capture filepath
-        # Match ```, capture rest of line (info string)
         "start_regex_pattern": r"^```(?!``)(.*)$",
         "get_end_delimiter": lambda fp: "```",
         "skip_start_line_in_content": False,  # The fence line isn't content
@@ -62,8 +61,7 @@ MERGE_FORMATS = {
 
 
 # --- Data Roles for Tree Items ---
-PATH_DATA_ROLE = Qt.ItemDataRole.UserRole + \
-    1  # Stores the full absolute path (str)
+PATH_DATA_ROLE = Qt.ItemDataRole.UserRole + 1  # Stores the full absolute path (str)
 # Stores "file", "folder", or "folder-root" (str)
 TYPE_DATA_ROLE = Qt.ItemDataRole.UserRole + 2
 # Stores the base path for relative calculation (str)

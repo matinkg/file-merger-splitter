@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QLabel, QDialogButtonBox, QStyle, QMessageBox  # Added QMessageBox
 )
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QModelIndex
 
 # Import constants from config.py
 from config import PATH_DATA_ROLE, TYPE_DATA_ROLE
@@ -174,15 +174,9 @@ class FolderSelectionDialog(QDialog):
         # Check if the original path represents a directory
         is_dir = relative_path_obj.is_dir()
 
-        # Ensure the item actually exists before checking if it's a dir
-        # The relative path might not directly correspond to an item in the model sometimes?
-        # Let's rely on the item type from the model instead for dir check if possible
-        # Reverted: We need the original path type here for pattern matching logic
-
         # Determine initial match status (False = not ignored)
         ignored = False
         # Track the most specific pattern match (negated or not)
-        last_match_negated = False
         last_match_specificity = -1  # Higher is more specific
 
         for i, pattern in enumerate(self.gitignore_patterns):
@@ -245,9 +239,7 @@ class FolderSelectionDialog(QDialog):
                 # Using index as specificity (later rules override earlier)
                 if i > last_match_specificity:
                     ignored = not negated  # If negated, it's NOT ignored
-                    last_match_negated = negated
                     last_match_specificity = i
-                # print(f"Path '{relative_path_str}' matched pattern '{original_pattern}' (negated={negated}). Current ignored: {ignored}")
 
         return ignored
 
@@ -272,7 +264,6 @@ class FolderSelectionDialog(QDialog):
                     if filter_func(item, absolute_path, *args):
                         # Uncheck only if it's currently checked or partially checked
                         if item.checkState() != Qt.CheckState.Unchecked:
-                            # DO NOT block signals - let on_item_changed handle propagation
                             item.setCheckState(Qt.CheckState.Unchecked)
                             # Mark for potential parent update check
                             items_to_revisit.append(item)
@@ -293,8 +284,6 @@ class FolderSelectionDialog(QDialog):
             try:
                 # Calculate path relative to the folder containing .gitignore
                 relative_path = absolute_path.relative_to(self.folder_path)
-                # Fetch is_dir status from the actual file system item for matching logic
-                is_dir_check = absolute_path.is_dir()
                 # Pass the relative path object to the matching function
                 return self._matches_gitignore_pattern(relative_path)
             except ValueError:
@@ -307,11 +296,7 @@ class FolderSelectionDialog(QDialog):
 
         # Apply the filter starting from the invisible root
         root_node = self.model.invisibleRootItem()
-        # --- Apply filter without blocking signals ---
-        # self.model.blockSignals(True) # DO NOT BLOCK signals
         self._apply_filter_recursive(root_node, gitignore_check)
-        # self.model.blockSignals(False)
-        # --- No manual parent update needed if signals are not blocked ---
         print("Finished applying .gitignore filter.")
 
     def apply_hidden_filter(self):
@@ -325,11 +310,7 @@ class FolderSelectionDialog(QDialog):
 
         # Apply the filter starting from the invisible root
         root_node = self.model.invisibleRootItem()
-        # --- Apply filter without blocking signals ---
-        # self.model.blockSignals(True) # DO NOT BLOCK signals
         self._apply_filter_recursive(root_node, hidden_check)
-        # self.model.blockSignals(False)
-        # --- No manual parent update needed if signals are not blocked ---
         print("Finished applying hidden file/folder filter.")
 
     # --- End Filter Logic Implementation ---
@@ -368,8 +349,9 @@ class FolderSelectionDialog(QDialog):
                 # Only change state if it's different, prevents unnecessary signal emissions if we weren't blocking
                 if child.checkState() != state:
                     child.setCheckState(state)
-                # Recursion happens naturally because setting checkState on a child folder
-                # will trigger on_item_changed for that child (once signals are unblocked).
+                # If the child is a folder, propagate to its children
+                if child.data(TYPE_DATA_ROLE) == "folder":
+                    self._set_child_check_state_recursive(child, state)
 
     def _update_parent_check_state(self, item: QStandardItem):
         """Updates the check state of a parent item based on its children's states."""

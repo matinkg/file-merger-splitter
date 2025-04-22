@@ -1,0 +1,2285 @@
+--- START FILE HIERARCHY ---
+└── open-idm/
+    ├── dialogs/
+    │   ├── __init__.py
+    │   └── download_progress_dialog.py
+    ├── ui_utils/
+    │   ├── __init__.py
+    │   └── icons.py
+    ├── widgets/
+    │   ├── __init__.py
+    │   └── category_tree.py
+    ├── idm_mockup.py
+    ├── main.py
+    └── main_window.py
+--- END FILE HIERARCHY ---
+
+
+--- START FILE: open-idm/dialogs/__init__.py ---
+--- END FILE: open-idm/dialogs/__init__.py ---
+
+
+--- START FILE: open-idm/dialogs/download_progress_dialog.py ---
+import sys
+import uuid  # Import uuid for unique IDs
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QLabel,
+    QLineEdit, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QSpacerItem, QSizePolicy, QFormLayout,
+    QFrame
+)
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QFont
+
+
+class DownloadInfo:
+    def __init__(self, url=""):
+        # --- Core Management Data ---
+        self.id = str(uuid.uuid4())  # Unique identifier
+        self.url = url
+        self.queue_name = "Main"  # Default queue
+        self.file_name = ""  # Will be determined later or set explicitly
+        self.save_path = ""  # Where the file will be saved
+        self.category = "unknown"  # e.g., video, program, document
+
+        # --- Status and Progress Data (Defaults) ---
+        self.status = "Queued"  # Initial status
+        self.file_size_bytes = 0
+        self.downloaded_bytes = 0
+        self.transfer_rate_bps = 0
+        self.resume_capability = False  # Determined during download attempt
+        self.time_left_seconds = -1  # -1 for unknown/N/A
+        self.last_try_date = None  # datetime object
+        self.description = ""
+        self.creation_date = None  # datetime object
+
+        # --- Runtime/Display Data (can be placeholders initially) ---
+        # Placeholder for connection details - populated during actual download
+        self.connections = []
+
+        # --- Example/Placeholder Data (if needed for standalone testing) ---
+        if not url:  # Only set example data if no URL provided (for testing)
+            self.url = "https://example.com/some_large_file.zip"
+            self.file_name = "Game.of.Thrones.S01E03.1080p.10bit.B....mkv"
+            self.file_size_bytes = 928 * 1024 * 1024
+            self.downloaded_bytes = 0  # Start at 0 for queued
+            self.status = "Queued"  # Example starts queued
+            self.resume_capability = True  # Assume yes for example
+            self.category = "video"
+            self.description = "GoT Episode"
+            # Keep connections empty initially, populate dynamically
+            self.connections = [
+                # Example structure, would be empty for a new download
+                # {"id": 1, "downloaded": 0, "status": "Waiting..."},
+                # {"id": 2, "downloaded": 0, "status": "Waiting..."}
+            ]
+
+    def update_for_progress_dialog(self):
+        """ Helper to populate dummy progress data if needed for dialog display testing"""
+        # Only apply if it's the default example and status is Queued/Paused
+        if self.file_name == "Game.of.Thrones.S01E03.1080p.10bit.B....mkv" and self.status in ["Queued", "Paused (56.73%)"]:
+            self.downloaded_bytes = 527 * 1024 * 1024
+            self.transfer_rate_bps = 162 * 1024 * 8
+            self.status = "Receiving data..."
+            self.time_left_seconds = (self.file_size_bytes - self.downloaded_bytes) / (
+                self.transfer_rate_bps / 8) if self.transfer_rate_bps > 0 else -1
+            self.connections = [
+                {"id": 1, "downloaded": 65 * 1024 *
+                    1024, "status": "Receiving data..."},
+                {"id": 2, "downloaded": 67 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 3, "downloaded": 66 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 4, "downloaded": 65 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 5, "downloaded": 61 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 6, "downloaded": 71 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 7, "downloaded": 71 * 1024 *
+                 1024, "status": "Receiving data..."},
+                {"id": 8, "downloaded": 61 * 1024 * 1024,
+                    "status": "Receiving data..."},  # Made one more active
+            ]
+
+
+# --- Helper Functions (Unchanged) ---
+def format_size(size_bytes):
+    """ Formats bytes into KB, MB, GB """
+    if size_bytes is None or size_bytes < 0:
+        return "N/A"
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024**2:
+        # Use 2 decimal places for smaller units
+        return f"{size_bytes/1024:.2f} KB"
+    elif size_bytes < 1024**3:
+        return f"{size_bytes/1024**2:.2f} MB"
+    else:
+        return f"{size_bytes/1024**3:.2f} GB"
+
+
+def format_speed(speed_bps):
+    """ Formats bits per second into KB/s, MB/s """
+    if speed_bps is None or speed_bps <= 0:
+        return ""  # Return empty if no speed
+    speed_bytes_sec = speed_bps / 8
+    if speed_bytes_sec < 1024:
+        return f"{speed_bytes_sec:.1f} B/sec"
+    elif speed_bytes_sec < 1024**2:
+        return f"{speed_bytes_sec/1024:.1f} KB/sec"
+    else:
+        return f"{speed_bytes_sec/1024**2:.1f} MB/sec"
+
+
+def format_time(seconds):
+    """ Formats seconds into min sec or hr min sec """
+    if seconds is None or seconds < 0:
+        return ""  # Return empty if N/A
+    if seconds == 0:
+        return "Done"
+    if seconds < 60:
+        return f"{int(seconds)} sec"
+    elif seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins} min {secs} sec"
+    else:
+        hrs = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hrs} hr {mins} min {secs} sec"
+
+
+class DownloadProgressDialog(QDialog):
+    def __init__(self, download_info: DownloadInfo, parent=None):  # Type hint
+        super().__init__(parent)
+        self.download_info = download_info
+        # Make a copy or simulate update for dialog display if needed
+        # self.download_info.update_for_progress_dialog() # Call this if you want demo data for display
+
+        self.details_visible = True
+
+        self.setWindowTitle(
+            f"{self._calculate_percentage():.1f}% {self.download_info.file_name or 'Download Progress'}")
+        self.setMinimumWidth(600)
+
+        # --- Main Layout ---
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+
+        # --- Tab Widget ---
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+
+        # --- Download Status Tab ---
+        status_tab_widget = QWidget()
+        status_tab_layout = QVBoxLayout(status_tab_widget)
+        status_tab_layout.setContentsMargins(9, 9, 9, 9)
+
+        # URL Display
+        self.url_display = QLineEdit(self.download_info.url)
+        self.url_display.setReadOnly(True)
+        font = self.url_display.font()
+        font.setPointSize(font.pointSize() - 1)
+        self.url_display.setFont(font)
+        status_tab_layout.addWidget(self.url_display)
+
+        # Status Info Section (using QFormLayout)
+        status_info_layout = QFormLayout()
+        status_info_layout.setRowWrapPolicy(
+            QFormLayout.RowWrapPolicy.DontWrapRows)
+        status_info_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        status_info_layout.setContentsMargins(0, 10, 0, 10)
+
+        self.status_label = QLabel(self.download_info.status)
+        self.file_size_label = QLabel(
+            format_size(self.download_info.file_size_bytes))
+        percent = self._calculate_percentage()
+        self.downloaded_label = QLabel(
+            f"{format_size(self.download_info.downloaded_bytes)} ({percent:.2f} %)" if self.download_info.file_size_bytes > 0 else format_size(
+                self.download_info.downloaded_bytes)
+        )
+        self.transfer_rate_label = QLabel(
+            format_speed(self.download_info.transfer_rate_bps))
+        self.time_left_label = QLabel(format_time(
+            self.download_info.time_left_seconds))
+        self.resume_cap_label = QLabel(
+            "Yes" if self.download_info.resume_capability else "No")  # Use "?" maybe if unknown?
+
+        status_info_layout.addRow("Status:", self.status_label)
+        status_info_layout.addRow("File size:", self.file_size_label)
+        status_info_layout.addRow("Downloaded:", self.downloaded_label)
+        status_info_layout.addRow("Transfer rate:", self.transfer_rate_label)
+        status_info_layout.addRow("Time left:", self.time_left_label)
+        status_info_layout.addRow("Resume capability:", self.resume_cap_label)
+        # Add Queue Info
+        status_info_layout.addRow(
+            "Queue:", QLabel(self.download_info.queue_name))
+
+        status_tab_layout.addLayout(status_info_layout)
+
+        # Main Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(int(percent))
+        self.progress_bar.setTextVisible(False)
+        status_tab_layout.addWidget(self.progress_bar)
+
+        # --- Action Buttons ---
+        action_buttons_layout = QHBoxLayout()
+        self.hide_details_button = QPushButton("<< Hide details")
+        self.pause_resume_button = QPushButton("Pause")
+        self.cancel_button = QPushButton("Cancel")
+
+        action_buttons_layout.addWidget(self.hide_details_button)
+        action_buttons_layout.addSpacerItem(QSpacerItem(
+            40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+        action_buttons_layout.addWidget(self.pause_resume_button)
+        action_buttons_layout.addWidget(self.cancel_button)
+        status_tab_layout.addLayout(action_buttons_layout)
+
+        # --- Details Section ---
+        self.details_frame = QFrame()
+        self.details_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.details_frame.setFrameShadow(QFrame.Shadow.Sunken)
+        details_layout = QVBoxLayout(self.details_frame)
+        details_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Segmented Progress Bar Placeholder
+        details_layout.addWidget(
+            QLabel("Start positions and download progress by connections"))
+        self.segmented_progress_layout = QHBoxLayout()
+        self.segmented_progress_layout.setSpacing(1)
+        self._update_segmented_progress()  # Call helper to build/update
+        details_layout.addLayout(self.segmented_progress_layout)
+        details_layout.addSpacerItem(QSpacerItem(
+            20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+
+        # Connection Details Table
+        self.connections_table = QTableWidget()
+        self._setup_connections_table()
+        self._populate_connections_table()
+        details_layout.addWidget(self.connections_table)
+
+        status_tab_layout.addWidget(self.details_frame)
+
+        # --- Add Tabs ---
+        self.tab_widget.addTab(status_tab_widget, "Download status")
+        self.tab_widget.addTab(QWidget(), "Speed Limiter")
+        self.tab_widget.addTab(QWidget(), "Options on completion")
+
+        # --- Connect Signals ---
+        self.hide_details_button.clicked.connect(self.toggle_details)
+        self.pause_resume_button.clicked.connect(self.toggle_pause_resume)
+        self.cancel_button.clicked.connect(self.reject)
+
+        self._update_ui_state()
+
+    def _setup_connections_table(self):
+        # (Unchanged from previous version)
+        headers = ["N.", "Downloaded", "Info"]
+        self.connections_table.setColumnCount(len(headers))
+        self.connections_table.setHorizontalHeaderLabels(headers)
+        self.connections_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.connections_table.setEditTriggers(
+            QAbstractItemView.EditTriggers.NoEditTriggers)
+        self.connections_table.setShowGrid(False)
+        self.connections_table.verticalHeader().setVisible(False)
+        self.connections_table.setAlternatingRowColors(True)
+        header = self.connections_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.resizeSection(1, 100)
+
+    def _populate_connections_table(self):
+        self.connections_table.setRowCount(0)
+        if not self.download_info or not self.download_info.connections:
+            return
+
+        self.connections_table.setRowCount(len(self.download_info.connections))
+        for i, conn_data in enumerate(self.download_info.connections):
+            item_n = QTableWidgetItem(str(conn_data.get("id", i + 1)))
+            item_downloaded = QTableWidgetItem(
+                format_size(conn_data.get("downloaded", 0)))
+            item_info = QTableWidgetItem(conn_data.get("status", "..."))
+
+            item_n.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_downloaded.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.connections_table.setItem(i, 0, item_n)
+            self.connections_table.setItem(i, 1, item_downloaded)
+            self.connections_table.setItem(i, 2, item_info)
+
+    def _calculate_percentage(self):
+        if not self.download_info or self.download_info.file_size_bytes is None or self.download_info.file_size_bytes <= 0:
+            return 0.0
+        downloaded = self.download_info.downloaded_bytes or 0
+        return (downloaded / self.download_info.file_size_bytes) * 100.0
+
+    def _update_segmented_progress(self):
+        # Clear existing widgets first
+        while self.segmented_progress_layout.count():
+            item = self.segmented_progress_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        # Constants for demo - real app would use actual segment info
+        num_segments = 16  # Example
+        total_size = self.download_info.file_size_bytes or 1  # Avoid division by zero
+        downloaded = self.download_info.downloaded_bytes or 0
+
+        segment_size = total_size / num_segments if num_segments > 0 else 0
+
+        # --- Simulate based on connection data if available ---
+        if self.download_info.connections and total_size > 0:
+            # This is a simplified view - real IDM maps connections to file ranges
+            # Here we just divide the file size evenly and sum connection progress
+            bytes_per_segment = total_size / num_segments
+            connection_progress = {i: 0 for i in range(
+                num_segments)}  # progress per segment index
+
+            current_byte = 0
+            for conn in self.download_info.connections:
+                # Very rough distribution - assumes connections download contiguous blocks sequentially
+                # This is NOT how real multi-part download works, just for visual variety
+                conn_dl = conn.get("downloaded", 0)
+                start_segment = int(current_byte // bytes_per_segment)
+                end_byte = current_byte + conn_dl
+                end_segment = int(end_byte // bytes_per_segment)
+
+                for seg_idx in range(start_segment, min(end_segment + 1, num_segments)):
+                    seg_start_byte = seg_idx * bytes_per_segment
+                    seg_end_byte = (seg_idx + 1) * bytes_per_segment
+                    overlap_start = max(current_byte, seg_start_byte)
+                    overlap_end = min(end_byte, seg_end_byte)
+                    if overlap_end > overlap_start:
+                        connection_progress[seg_idx] += (
+                            overlap_end - overlap_start)
+
+                current_byte = end_byte  # Move start for next simulated connection block
+
+            for i in range(num_segments):
+                bar = QProgressBar()
+                bar.setMaximum(100)
+                seg_downloaded = connection_progress.get(i, 0)
+                seg_percent = int((seg_downloaded / bytes_per_segment)
+                                  * 100) if bytes_per_segment > 0 else 0
+                bar.setValue(seg_percent)
+                bar.setTextVisible(False)
+                bar.setFixedHeight(10)
+                self.segmented_progress_layout.addWidget(bar)
+
+        else:  # Fallback to simple overall progress distributed
+            filled_segments = int((downloaded / total_size)
+                                  * num_segments) if total_size > 0 else 0
+            partial_segment_value = 0
+            if total_size > 0 and filled_segments < num_segments:
+                partial_segment_downloaded = downloaded - \
+                    (filled_segments * segment_size)
+                partial_segment_value = int(
+                    (partial_segment_downloaded / segment_size) * 100) if segment_size > 0 else 0
+
+            for i in range(num_segments):
+                bar = QProgressBar()
+                bar.setMaximum(100)
+                if i < filled_segments:
+                    bar.setValue(100)
+                elif i == filled_segments:
+                    bar.setValue(partial_segment_value)
+                else:
+                    bar.setValue(0)
+                bar.setTextVisible(False)
+                bar.setFixedHeight(10)
+                self.segmented_progress_layout.addWidget(bar)
+
+    def _update_ui_state(self):
+        """ Updates UI elements based on current download_info state """
+        percent = self._calculate_percentage()
+        self.setWindowTitle(
+            f"{percent:.1f}% {self.download_info.file_name or 'Download Progress'}")
+
+        self.status_label.setText(self.download_info.status or "N/A")
+        self.file_size_label.setText(format_size(
+            self.download_info.file_size_bytes))
+        self.downloaded_label.setText(
+            f"{format_size(self.download_info.downloaded_bytes)} ({percent:.2f} %)" if self.download_info.file_size_bytes > 0 else format_size(
+                self.download_info.downloaded_bytes)
+        )
+        self.transfer_rate_label.setText(
+            format_speed(self.download_info.transfer_rate_bps))
+        self.time_left_label.setText(format_time(
+            self.download_info.time_left_seconds))
+        self.resume_cap_label.setText(
+            "Yes" if self.download_info.resume_capability else "No")
+        self.progress_bar.setValue(int(percent))
+
+        status_lower = (self.download_info.status or "").lower()
+        is_active = "downloading" in status_lower or "receiving" in status_lower
+        is_paused = "paused" in status_lower or "stopped" in status_lower or "error" in status_lower
+        is_queued = "queued" in status_lower
+        is_complete = "complete" in status_lower
+
+        if is_active:
+            self.pause_resume_button.setText("Pause")
+            self.pause_resume_button.setEnabled(True)
+        elif is_paused:
+            self.pause_resume_button.setText("Resume")
+            self.pause_resume_button.setEnabled(
+                self.download_info.resume_capability)
+        elif is_queued:
+            # Or maybe Resume? Let's use Start for Queued
+            self.pause_resume_button.setText("Start")
+            self.pause_resume_button.setEnabled(
+                True)  # Allow starting from queued
+        else:  # Complete, etc.
+            self.pause_resume_button.setText("Pause")  # Default text
+            self.pause_resume_button.setEnabled(False)
+
+        if self.details_visible:
+            self._populate_connections_table()
+            self._update_segmented_progress()
+
+    @Slot()
+    def toggle_details(self):
+        self.details_visible = not self.details_visible
+        self.details_frame.setVisible(self.details_visible)
+        self.hide_details_button.setText(
+            "<< Hide details" if self.details_visible else ">> Show details")
+        self.adjustSize()
+
+    @Slot()
+    def toggle_pause_resume(self):
+        current_text = self.pause_resume_button.text()
+        # --- IMPORTANT: This dialog should NOT modify the state directly ---
+        # --- It should emit signals or call methods on the main window/controller ---
+        # --- For now, we just print the action ---
+        if current_text == "Pause":
+            print(f"Action Request: Pause download {self.download_info.id}")
+            # --- TODO: Signal main controller to pause self.download_info.id ---
+            # --- Simulate state change ONLY for immediate UI feedback in this example ---
+            self.download_info.status = f"Paused ({self._calculate_percentage():.2f}%)"
+            self.download_info.transfer_rate_bps = 0
+            self.download_info.time_left_seconds = -1
+            self._update_ui_state()
+        elif current_text == "Resume" or current_text == "Start":
+            print(
+                f"Action Request: Resume/Start download {self.download_info.id}")
+            # --- TODO: Signal main controller to resume/start self.download_info.id ---
+            # --- Simulate state change ONLY for immediate UI feedback in this example ---
+            self.download_info.status = "Receiving data..."  # Or "Connecting..."
+            # Restore dummy speed for example
+            # self.download_info.transfer_rate_bps = 162 * 1024 * 8
+            # self.download_info.time_left_seconds = ... calculate ...
+            self._update_ui_state()  # Update UI immediately
+
+    def update_download_info(self, new_info: DownloadInfo):
+        """ Call this method externally to update the dialog with new download progress/status """
+        self.download_info = new_info
+        self._update_ui_state()
+
+
+# Example usage (standalone testing)
+if __name__ == '__main__':
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QTimer
+    import random
+
+    app = QApplication(sys.argv)
+
+    # Create dummy data using the updated class
+    info = DownloadInfo()  # Use the example data from constructor
+    info.status = "Paused (56.73%)"  # Start paused for testing resume
+    info.downloaded_bytes = 527 * 1024 * 1024  # Set initial downloaded
+
+    dialog = DownloadProgressDialog(info)
+    dialog.show()
+
+    # Simulate progress update
+    def simulate_update():
+        if dialog.isVisible() and "receiving" in dialog.download_info.status.lower():
+            # Only update if "downloading"
+            info = dialog.download_info  # Get current info from dialog instance
+            increment = random.randint(1, 5) * 1024 * 1024
+            info.downloaded_bytes += increment
+            info.downloaded_bytes = min(
+                info.downloaded_bytes, info.file_size_bytes)  # Cap at file size
+
+            if info.downloaded_bytes >= info.file_size_bytes:
+                info.status = "Complete"
+                info.transfer_rate_bps = 0
+                info.time_left_seconds = 0
+                info.downloaded_bytes = info.file_size_bytes  # Ensure exact match
+            else:
+                info.transfer_rate_bps = random.randint(
+                    100, 500) * 1024 * 8  # Vary speed
+                bytes_per_sec = info.transfer_rate_bps / 8
+                info.time_left_seconds = (
+                    info.file_size_bytes - info.downloaded_bytes) / bytes_per_sec if bytes_per_sec > 0 else -1
+
+            # Simulate connection progress (very basic)
+            active_connections = [
+                c for c in info.connections if "receiving" in c.get("status", "").lower()]
+            if active_connections:
+                increment_per_conn = increment / len(active_connections)
+                for conn in active_connections:
+                    conn['downloaded'] = conn.get(
+                        'downloaded', 0) + increment_per_conn
+
+            dialog.update_download_info(info)  # Update the dialog
+
+    timer = QTimer()
+    timer.timeout.connect(simulate_update)
+    timer.start(1000)  # Update every second
+
+    sys.exit(app.exec())
+--- END FILE: open-idm/dialogs/download_progress_dialog.py ---
+
+
+--- START FILE: open-idm/idm_mockup.py ---
+import sys
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QToolBar, QSplitter, QTreeWidget, QTreeWidgetItem, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel, QStyle,
+    QMessageBox # Added for simple feedback
+)
+
+
+from PySide6.QtGui import QAction, QIcon, QPixmap, QFont
+from PySide6.QtCore import Qt, QSize, Slot # Added Slot
+from PySide6.QtCore import Qt, QSize, Slot, QPoint
+
+    
+
+# --- Placeholder Icon Function (Keep as is for now) ---
+def get_icon(name):
+    # ... (your existing icon function)
+    # Consider replacing with real icons and maybe Qt Resource System later
+    standard_icons = {
+        "add": QStyle.StandardPixmap.SP_FileIcon, # Placeholder for Add URL
+        "resume": QStyle.StandardPixmap.SP_MediaPlay,
+        "stop": QStyle.StandardPixmap.SP_MediaStop,
+        "stop_all": QStyle.StandardPixmap.SP_BrowserStop,
+        "delete": QStyle.StandardPixmap.SP_TrashIcon,
+        "options": QStyle.StandardPixmap.SP_ComputerIcon, # Placeholder for options/settings
+        "schedule": QStyle.StandardPixmap.SP_DialogYesButton, # Placeholder
+        "start_q": QStyle.StandardPixmap.SP_MediaSeekForward, # Placeholder
+        "stop_q": QStyle.StandardPixmap.SP_MediaPause, # Placeholder
+        "grabber": QStyle.StandardPixmap.SP_ArrowDown, # Placeholder
+        "tell_friend": QStyle.StandardPixmap.SP_DialogApplyButton, # Placeholder
+        "folder": QStyle.StandardPixmap.SP_DirIcon,
+        "file": QStyle.StandardPixmap.SP_FileIcon,
+        "music": QStyle.StandardPixmap.SP_MediaVolume, # Placeholder
+        "video": QStyle.StandardPixmap.SP_MediaPlay, # Placeholder
+        "program": QStyle.StandardPixmap.SP_DesktopIcon, # Placeholder
+        "compressed": QStyle.StandardPixmap.SP_DialogSaveButton, # Placeholder
+        "document": QStyle.StandardPixmap.SP_FileIcon, # Placeholder
+        "unfinished": QStyle.StandardPixmap.SP_DialogCancelButton, # Placeholder
+        "finished": QStyle.StandardPixmap.SP_DialogApplyButton, # Placeholder
+        "grabber_proj": QStyle.StandardPixmap.SP_ArrowDown, # Placeholder
+        "queues": QStyle.StandardPixmap.SP_DirIcon, # Placeholder
+        "exe": QStyle.StandardPixmap.SP_ComputerIcon # Placeholder for .exe
+    }
+    if name in standard_icons:
+        try:
+            style = QApplication.instance().style() # Use QApplication.instance()
+            icon = style.standardIcon(standard_icons[name])
+            if not icon.isNull():
+                return icon
+        except Exception:
+            pass
+    pixmap = QPixmap(16, 16)
+    colors = {
+        "add": Qt.GlobalColor.blue, "resume": Qt.GlobalColor.green, "stop": Qt.GlobalColor.red,
+        "stop_all": Qt.GlobalColor.darkRed, "delete": Qt.GlobalColor.magenta, "options": Qt.GlobalColor.gray,
+        "schedule": Qt.GlobalColor.cyan, "start_q": Qt.GlobalColor.darkGreen, "stop_q": Qt.GlobalColor.darkYellow,
+        "grabber": Qt.GlobalColor.darkBlue, "tell_friend": Qt.GlobalColor.darkCyan,
+        "folder": Qt.GlobalColor.yellow, "file": Qt.GlobalColor.white,
+        "music": Qt.GlobalColor.lightGray, "video": Qt.GlobalColor.blue, "program": Qt.GlobalColor.darkGray,
+        "compressed": Qt.GlobalColor.green, "document": Qt.GlobalColor.white,
+        "unfinished": Qt.GlobalColor.red, "finished": Qt.GlobalColor.green,
+        "grabber_proj": Qt.GlobalColor.darkBlue, "queues": Qt.GlobalColor.yellow,
+        "exe": Qt.GlobalColor.darkGray
+    }
+    pixmap.fill(colors.get(name, Qt.GlobalColor.black))
+    return QIcon(pixmap)
+
+
+class IdmStyleWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Open-IDM (Concept)") # Updated title
+        self.setGeometry(100, 100, 950, 600)
+
+        # Store actions for easy access (e.g., to enable/disable)
+        self.actions = {}
+
+        self._create_menu_bar()
+        self._create_tool_bar()
+        self._create_central_widget()
+        self._connect_signals()
+        self._update_toolbar_state() # Initial state
+
+    def _create_menu_bar(self):
+        menu_bar = self.menuBar()
+        menu_bar.setNativeMenuBar(True)
+
+        tasks_menu = menu_bar.addMenu("Tasks")
+        # Example: Store action when creating
+        add_action = tasks_menu.addAction("Add new download")
+        add_action.triggered.connect(self._add_url_dialog) # Connect here or later
+        # ... add other menu items ...
+        tasks_menu.addAction("Exit").triggered.connect(self.close)
+
+        # Add placeholder actions for other menus
+        file_menu = menu_bar.addMenu("File")
+        downloads_menu = menu_bar.addMenu("Downloads")
+        view_menu = menu_bar.addMenu("View")
+        help_menu = menu_bar.addMenu("Help")
+        registration_menu = menu_bar.addMenu("Registration")
+        file_menu.addAction("Dummy Action 1")
+        downloads_menu.addAction("Dummy Action 2")
+
+
+    def _create_tool_bar(self):
+        toolbar = QToolBar("Main Toolbar")
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.addToolBar(toolbar)
+
+        action_defs = [
+            ("Add URL", "add", self._add_url_dialog),
+            ("Resume", "resume", self._resume_selected),
+            ("Stop", "stop", self._stop_selected),
+            ("Stop All", "stop_all", self._stop_all),
+            ("Delete", "delete", self._delete_selected),
+            ("Options", "options", self._show_options),
+            ("Scheduler", "schedule", self._show_scheduler),
+            ("Start Q.", "start_q", self._start_queue),
+            ("Stop Q.", "stop_q", self._stop_queue),
+            ("Grabber", "grabber", self._show_grabber),
+            ("Tell a Fr...", "tell_friend", self._tell_friend)
+        ]
+
+        for text, icon_name, slot in action_defs:
+            action = QAction(get_icon(icon_name), text, self)
+            action.triggered.connect(slot)
+            toolbar.addAction(action)
+            self.actions[text] = action # Store action by name
+            # Add separators visually
+            if text in ["Delete", "Stop Q."]:
+                 toolbar.addSeparator()
+
+    def _create_central_widget(self):
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(splitter)
+
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderHidden(True)
+        self.tree_widget.setMinimumWidth(180)
+        self._populate_tree()
+        splitter.addWidget(self.tree_widget)
+
+        # !!! Consider replacing QTableWidget with QTableView + QAbstractTableModel !!!
+        self.table_widget = QTableWidget()
+        self._setup_table()
+        self._populate_table() # Populate with initial dummy data or leave empty
+        splitter.addWidget(self.table_widget)
+
+        splitter.setSizes([200, 750])
+
+    def _populate_tree(self):
+        # ... (your existing tree population code) ...
+        self.tree_widget.clear()
+        def create_item(parent, text, icon_name, data=None): # Add data field
+            item = QTreeWidgetItem(parent)
+            item.setText(0, text)
+            item.setIcon(0, get_icon(icon_name))
+            item.setData(0, Qt.ItemDataRole.UserRole, data if data else text) # Store category key
+            return item
+
+        all_downloads = create_item(self.tree_widget, "All Downloads", "folder", "all")
+        unfinished = create_item(self.tree_widget, "Unfinished", "unfinished", "unfinished")
+        finished = create_item(self.tree_widget, "Finished", "finished", "finished")
+        grabber = create_item(self.tree_widget, "Grabber projects", "grabber_proj", "grabber")
+        queues = create_item(self.tree_widget, "Queues", "queues", "queues")
+
+        create_item(all_downloads, "Compressed", "compressed", "compressed")
+        create_item(all_downloads, "Documents", "document", "document")
+        create_item(all_downloads, "Music", "music", "music")
+        create_item(all_downloads, "Programs", "program", "program")
+        create_item(all_downloads, "Video", "video", "video")
+
+        all_downloads.setExpanded(True)
+        finished.setText(0, "✔ Finished") # Keep simple text prefix for now
+
+
+    def _setup_table(self):
+        # ... (your existing table setup code) ...
+        # Recommend adding a dedicated "Progress" column if using delegates
+        headers = ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Last Try Date", "Description"]
+        self.table_widget.setColumnCount(len(headers))
+        self.table_widget.setHorizontalHeaderLabels(headers)
+        self.table_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_widget.setEditTriggers(QAbstractItemView.EditTriggers.NoEditTriggers)
+        self.table_widget.setShowGrid(False)
+        self.table_widget.verticalHeader().setVisible(False)
+        # Enable sorting
+        self.table_widget.setSortingEnabled(True)
+
+
+        header = self.table_widget.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.resizeSection(1, 30)
+        header.resizeSection(2, 80)
+        header.resizeSection(3, 120) # Give status more space for progress bar/text
+        header.resizeSection(4, 100)
+        header.resizeSection(5, 100)
+        header.resizeSection(6, 120)
+        header.resizeSection(7, 100)
+        # Add context menu policy
+        self.table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+
+    def _populate_table(self):
+        # Replace this with logic to populate from your DownloadModel
+        # For now, clear and add sample data
+        self.table_widget.setRowCount(0) # Clear existing rows
+        data = [
+             # ["ManyCamWebInstaller.exe", "", "61.18 MB", "Downloading", "1 min 55 sec", "512 KB/s", "Oct 18 17:...", ""], # Example Downloading
+            ["ManyCamWebInstaller.exe", "", "61.18 MB", "Paused (19.13%)", "", "", "Oct 18 17:...", ""], # Example Paused
+            ["idman631build9.exe", "", "7.12 MB", "Complete", "", "", "Oct 18 17:...", ""],
+            # ["CareSuiteForStore-5.6.13...", "", "251.03 MB", "Error: Connection Failed", "", "", "Oct 18 17:...", ""], # Example Error
+            ["Some Video File.mp4", "Q1", "1.2 GB", "Queued", "", "", "Oct 19 10:00", "My important video"], # Example Queued
+        ]
+        self.table_widget.setRowCount(len(data))
+        for row_idx, row_data in enumerate(data):
+            file_item = QTableWidgetItem(get_icon("exe"), row_data[0]) # Infer icon later
+            self.table_widget.setItem(row_idx, 0, file_item)
+            for col_idx in range(1, len(row_data)):
+                item = QTableWidgetItem(row_data[col_idx])
+                # Example alignment
+                if col_idx in [1, 2]: # Q, Size
+                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table_widget.setItem(row_idx, col_idx, item)
+        # TODO: Implement progress bar delegate for 'Status' column
+
+
+    def _connect_signals(self):
+        """Connect GUI signals to slots."""
+        self.tree_widget.currentItemChanged.connect(self._category_selected)
+        self.table_widget.itemSelectionChanged.connect(self._update_toolbar_state)
+        # Connect context menu request
+        self.table_widget.customContextMenuRequested.connect(self._show_table_context_menu)
+
+
+    # --- Placeholder Slots (Implement Logic Here) ---
+
+    @Slot()
+    def _add_url_dialog(self):
+        print("Action: Add URL")
+        # TODO: Show a QDialog to get URL
+        # Example: from PySide6.QtWidgets import QInputDialog
+        # url, ok = QInputDialog.getText(self, "Add New Download", "Enter URL:")
+        # if ok and url:
+        #     print(f"URL Added: {url}")
+        #     # TODO: Add to download model/list
+        QMessageBox.information(self, "Action", "Add URL clicked (implement dialog)")
+
+    @Slot()
+    def _resume_selected(self):
+        print("Action: Resume Selected")
+        selected_rows = self._get_selected_rows()
+        if selected_rows:
+            print(f"  Rows: {selected_rows}")
+            # TODO: Implement resume logic for selected downloads
+            QMessageBox.information(self, "Action", f"Resume {len(selected_rows)} download(s)")
+        else:
+            print("  No selection")
+
+
+    @Slot()
+    def _stop_selected(self):
+        print("Action: Stop Selected")
+        selected_rows = self._get_selected_rows()
+        if selected_rows:
+            print(f"  Rows: {selected_rows}")
+            # TODO: Implement stop logic
+            QMessageBox.information(self, "Action", f"Stop {len(selected_rows)} download(s)")
+        else:
+            print("  No selection")
+
+    @Slot()
+    def _stop_all(self):
+        print("Action: Stop All")
+        # TODO: Implement stop all logic
+        QMessageBox.information(self, "Action", "Stop All clicked")
+
+    @Slot()
+    def _delete_selected(self):
+        print("Action: Delete Selected")
+        selected_rows = self._get_selected_rows()
+        if selected_rows:
+            # Confirmation dialog
+            reply = QMessageBox.question(self, "Confirm Delete",
+                                         f"Are you sure you want to delete {len(selected_rows)} selected download(s)?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                print(f"  Deleting rows: {selected_rows}")
+                # TODO: Implement delete logic (remove from model, optionally delete file)
+                # Need to delete rows in reverse order to avoid index issues with QTableWidget
+                for row in sorted(selected_rows, reverse=True):
+                    self.table_widget.removeRow(row)
+                self._update_toolbar_state() # Selection cleared after removal
+            else:
+                print("  Deletion cancelled")
+        else:
+            print("  No selection")
+
+    @Slot()
+    def _show_options(self):
+        print("Action: Options")
+        # TODO: Create and show an options QDialog
+        QMessageBox.information(self, "Action", "Options clicked (implement dialog)")
+
+    @Slot()
+    def _show_scheduler(self):
+        print("Action: Scheduler")
+        # TODO: Create and show scheduler QDialog
+        QMessageBox.information(self, "Action", "Scheduler clicked (implement dialog)")
+
+    @Slot()
+    def _start_queue(self):
+        print("Action: Start Queue")
+        # TODO: Implement start queue logic
+        QMessageBox.information(self, "Action", "Start Queue clicked")
+
+    @Slot()
+    def _stop_queue(self):
+        print("Action: Stop Queue")
+        # TODO: Implement stop queue logic
+        QMessageBox.information(self, "Action", "Stop Queue clicked")
+
+    @Slot()
+    def _show_grabber(self):
+        print("Action: Grabber")
+        # TODO: Create and show grabber QDialog/Window
+        QMessageBox.information(self, "Action", "Grabber clicked (implement dialog)")
+
+    @Slot()
+    def _tell_friend(self):
+        print("Action: Tell a Friend")
+        # TODO: Implement tell-a-friend logic (e.g., open email client)
+        QMessageBox.information(self, "Action", "Tell a Friend clicked")
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _category_selected(self, current, previous):
+        if current:
+            category_key = current.data(0, Qt.ItemDataRole.UserRole)
+            print(f"Category selected: {current.text(0)} (Key: {category_key})")
+            # TODO: Filter the table view based on the selected category_key
+            # If using QSortFilterProxyModel, call its setFilterRole/setFilterFixedString here.
+            # If managing manually, re-populate the table or hide/show rows.
+            self._populate_table() # Simple re-populate for demo
+
+    @Slot()
+    def _update_toolbar_state(self):
+        """Enable/disable toolbar actions based on table selection."""
+        selected_items = self.table_widget.selectedItems()
+        has_selection = bool(selected_items)
+        # Basic logic: enable stop/resume/delete if something is selected
+        self.actions["Resume"].setEnabled(has_selection)
+        self.actions["Stop"].setEnabled(has_selection)
+        self.actions["Delete"].setEnabled(has_selection)
+        # TODO: Add more sophisticated logic based on the *status* of selected items
+        # (e.g., Resume only enabled if status is Paused or Error)
+
+    @Slot(QPoint)
+    def _show_table_context_menu(self, pos):
+        """Show right-click context menu for the table."""
+        selected_items = self.table_widget.selectedItems()
+        if not selected_items:
+            return # No menu if nothing selected or right-clicked on empty space
+
+        # Get global position for the menu
+        global_pos = self.table_widget.mapToGlobal(pos)
+
+        # Create menu
+        context_menu = QMenu(self)
+
+        # Add actions based on selection (can reuse toolbar actions)
+        context_menu.addAction(self.actions["Resume"])
+        context_menu.addAction(self.actions["Stop"])
+        context_menu.addSeparator()
+        context_menu.addAction(self.actions["Delete"])
+        context_menu.addSeparator()
+        # Add other relevant actions (e.g., Open Folder, Properties)
+        open_folder_action = context_menu.addAction("Open Containing Folder")
+        properties_action = context_menu.addAction("Properties")
+
+        # Connect new actions if needed
+        open_folder_action.triggered.connect(self._open_folder_selected)
+        properties_action.triggered.connect(self._show_properties_selected)
+
+        # Show the menu
+        context_menu.exec(global_pos)
+
+    def _get_selected_rows(self):
+        """Helper to get unique selected row indices."""
+        return sorted(list(set(index.row() for index in self.table_widget.selectedIndexes())))
+
+    @Slot()
+    def _open_folder_selected(self):
+        print("Context Action: Open Folder")
+        selected_rows = self._get_selected_rows()
+        if len(selected_rows) == 1:
+             # TODO: Get download path for the selected row and open it
+             print(f"  Opening folder for row {selected_rows[0]}")
+             QMessageBox.information(self, "Action", f"Open folder for row {selected_rows[0]}")
+        else:
+             print("  Select a single item to open folder")
+
+
+    @Slot()
+    def _show_properties_selected(self):
+        print("Context Action: Show Properties")
+        selected_rows = self._get_selected_rows()
+        if len(selected_rows) == 1:
+             # TODO: Get download info and show a properties dialog
+             print(f"  Showing properties for row {selected_rows[0]}")
+             QMessageBox.information(self, "Action", f"Show properties for row {selected_rows[0]}")
+        else:
+             print("  Select a single item to show properties")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    # app.setStyle('Fusion') # Optional: Test different styles
+    window = IdmStyleWindow()
+    window.show()
+    sys.exit(app.exec())
+--- END FILE: open-idm/idm_mockup.py ---
+
+
+--- START FILE: open-idm/main.py ---
+import sys
+from PySide6.QtWidgets import QApplication
+from main_window import IdmStyleWindow  # Import the main window class
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # Optional: Force a specific style
+    #app.setStyle('Fusion')
+
+    window = IdmStyleWindow()
+    window.show()
+
+    sys.exit(app.exec())
+--- END FILE: open-idm/main.py ---
+
+
+--- START FILE: open-idm/main_window.py ---
+import sys
+import os
+import uuid
+import datetime
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar,
+    QSplitter, QTableWidget, QTableWidgetItem, QHeaderView, QTreeWidgetItem,
+    QAbstractItemView, QLabel, QMessageBox, QMenu, QApplication, QInputDialog,
+    QLineEdit  # Added QLineEdit for the input dialog
+)
+from PySide6.QtGui import QAction, QIcon, QFont
+from PySide6.QtCore import Qt, QSize, Slot, QPoint, QTimer
+
+# Project imports
+from ui_utils.icons import get_icon
+from widgets.category_tree import CategoryTree
+from dialogs.download_progress_dialog import DownloadProgressDialog, DownloadInfo, format_size, format_speed, format_time
+
+
+class IdmStyleWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Open-IDM")
+        self.setGeometry(100, 100, 950, 600)
+
+        # --- Core Data ---
+        self.downloads = []  # List to store DownloadInfo objects
+        # Dictionary for queues: Key=Name, Value=dict (for future settings)
+        self.queues = {"Main": {}}
+
+        # --- Initialization Order Matters! ---
+        self.actions = {}               # Actions dictionary needed first
+        self._create_tool_bar()         # Create toolbar (populates self.actions)
+        # Create central widget (creates self.tree_widget) BEFORE menu bar
+        self._create_central_widget()
+        # Create menu bar (can now safely access actions and tree_widget)
+        self._create_menu_bar()
+        self._connect_signals()         # Connect signals AFTER all widgets/actions are created
+
+        # Initialize UI State
+        self._update_category_tree_queues()  # Add initial queues to tree
+        self._populate_table()              # Populate with empty or loaded data
+        self._update_toolbar_state()        # Set initial button enabled/disabled states
+
+    def _create_menu_bar(self):
+        menu_bar = self.menuBar()
+        # menu_bar.setNativeMenuBar(False) # Use True for macOS native, False otherwise
+
+        tasks_menu = menu_bar.addMenu("Tasks")
+        # Connect directly to the slot method
+        add_action = tasks_menu.addAction(
+            get_icon("add"), "Add new download...")
+        add_action.triggered.connect(self._add_url)
+
+        tasks_menu.addAction("Add batch download...")  # Placeholder
+        tasks_menu.addSeparator()
+        # Add queue management to menu as well?
+        manage_queues_menu = tasks_menu.addMenu("Queues")
+        add_q_action = manage_queues_menu.addAction("Add New Queue...")
+        # *** This line is now safe because self.tree_widget exists ***
+        add_q_action.triggered.connect(self.tree_widget._request_add_queue)
+
+        tasks_menu.addSeparator()
+        exit_action = tasks_menu.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+
+        file_menu = menu_bar.addMenu("File")
+        # TODO: Import/Export downloads?
+        file_menu.addAction("Import Downloads...")
+        file_menu.addAction("Export Downloads...")
+        file_menu.addSeparator()
+        file_menu.addAction("Exit").triggered.connect(self.close)
+
+        downloads_menu = menu_bar.addMenu("Downloads")
+        # Add actions that mirror toolbar buttons?
+        downloads_menu.addAction(self.actions["resume"])
+        downloads_menu.addAction(self.actions["stop"])
+        downloads_menu.addAction(self.actions["delete"])
+        downloads_menu.addSeparator()
+        downloads_menu.addAction(self.actions["start_q"])
+        downloads_menu.addAction(self.actions["stop_q"])
+
+        view_menu = menu_bar.addMenu("View")
+        help_menu = menu_bar.addMenu("Help")
+        # ... add more menu items ...
+
+    def _create_tool_bar(self):
+        toolbar = QToolBar("Main Toolbar")
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.addToolBar(toolbar)
+
+        # ("Text", "icon_name", internal_key, tooltip)
+        action_defs = [
+            ("Add URL", "add", "add_url", "Add a new download URL"),
+            ("Resume", "resume", "resume", "Resume selected downloads"),
+            ("Stop", "stop", "stop", "Stop selected downloads"),
+            ("Stop All", "stop_all", "stop_all", "Stop all active downloads"),
+            ("Delete", "delete", "delete", "Delete selected downloads from the list"),
+            ("Options", "options", "options", "Configure application settings"),
+            ("Scheduler", "schedule", "scheduler", "Manage download schedule"),
+            ("Start Q.", "start_q", "start_q",
+             "Start processing the selected queue"),
+            ("Stop Q.", "stop_q", "stop_q", "Stop processing the selected queue"),
+            ("Grabber", "grabber", "grabber", "Open site grabber tool"),
+            # ("Tell a Fr...", "tell_friend", "tell_friend", "Tell a friend about Open-IDM") # Removed for now
+        ]
+
+        for text, icon_name, key, tooltip in action_defs:
+            action = QAction(get_icon(icon_name), text, self)
+            action.setToolTip(tooltip)
+            # Connection happens in _connect_signals
+            toolbar.addAction(action)
+            self.actions[key] = action
+            if key in ["delete", "stop_q"]:  # Adjusted separators
+                toolbar.addSeparator()
+
+    def _create_central_widget(self):
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # --- Left Pane: Tree View ---
+        self.tree_widget = CategoryTree()
+        splitter.addWidget(self.tree_widget)
+
+        # --- Right Pane: Table View ---
+        self.table_widget = QTableWidget()
+        self._setup_table()
+        # Removed populate sample data here - called in __init__
+        splitter.addWidget(self.table_widget)
+
+        splitter.setSizes([200, 750])  # Initial size distribution
+
+    def _setup_table(self):
+        # Added Queue column
+        headers = ["File Name", "Size", "Status", "Time left",
+                   "Transfer rate", "Last Try Date", "Queue", "Description"]
+        self.table_widget.setColumnCount(len(headers))
+        self.table_widget.setHorizontalHeaderLabels(headers)
+
+        # --- Table Properties ---
+        self.table_widget.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        # Allow selecting multiple rows
+        self.table_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_widget.setEditTriggers(
+            QAbstractItemView.EditTriggers.NoEditTriggers)
+        self.table_widget.setShowGrid(False)
+        self.table_widget.verticalHeader().setVisible(False)
+        self.table_widget.setSortingEnabled(True)
+        self.table_widget.setAlternatingRowColors(True)
+        self.table_widget.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        # Performance hint for large lists
+        self.table_widget.setWordWrap(False)
+        self.table_widget.setTextElideMode(Qt.TextElideMode.ElideRight)
+
+        # --- Column Sizing ---
+        header = self.table_widget.horizontalHeader()
+        # File Name (Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Interactive)  # Size
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Interactive)  # Status
+        header.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Interactive)  # Time Left
+        header.setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Interactive)  # Rate
+        header.setSectionResizeMode(
+            5, QHeaderView.ResizeMode.Interactive)  # Last Try
+        header.setSectionResizeMode(
+            6, QHeaderView.ResizeMode.Interactive)  # Queue
+        header.setSectionResizeMode(
+            7, QHeaderView.ResizeMode.Interactive)  # Description
+
+        # Set default widths
+        header.resizeSection(1, 90)  # Size
+        header.resizeSection(2, 130)  # Status
+        header.resizeSection(3, 100)  # Time Left
+        header.resizeSection(4, 100)  # Rate
+        header.resizeSection(5, 110)  # Last Try
+        header.resizeSection(6, 80)  # Queue
+        header.resizeSection(7, 150)  # Description
+
+        # Set default sort column and order (e.g., by File Name ascending)
+        self.table_widget.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+
+    def _populate_table(self):
+        """Populates the table based on self.downloads and current filter."""
+        current_sort_column = self.table_widget.horizontalHeader().sortIndicatorSection()
+        current_sort_order = self.table_widget.horizontalHeader().sortIndicatorOrder()
+
+        # Disable sorting during population
+        self.table_widget.setSortingEnabled(False)
+        self.table_widget.setRowCount(0)  # Clear existing rows
+
+        selected_key, selected_type = self.tree_widget.get_selected_item_data()
+        # print(f"Populating table for: Key='{selected_key}', Type='{selected_type}'") # Debug
+
+        filtered_downloads = []
+        if selected_key is None or selected_key == "all":
+            filtered_downloads = self.downloads  # Show all
+        elif selected_type == "category":
+            if selected_key == "unfinished":
+                filtered_downloads = [d for d in self.downloads if (
+                    d.status or "").lower() != "complete"]
+            elif selected_key == "finished":
+                filtered_downloads = [d for d in self.downloads if (
+                    d.status or "").lower() == "complete"]
+            elif selected_key == "grabber":
+                # TODO: Filter for grabber projects if implemented
+                # filtered_downloads = [d for d in self.downloads if d.is_grabber_project]
+                pass
+            elif selected_key == "queues_root":
+                filtered_downloads = self.downloads  # Show all when 'Queues' root is selected
+            else:  # Specific category like "video", "program" etc.
+                filtered_downloads = [
+                    d for d in self.downloads if d.category == selected_key]
+        elif selected_type == "queue":
+            # Filter by the selected queue name
+            filtered_downloads = [
+                d for d in self.downloads if d.queue_name == selected_key]
+
+        self.table_widget.setRowCount(len(filtered_downloads))
+
+        for row_idx, download_info in enumerate(filtered_downloads):
+            # Determine icon based on category or status
+            icon = get_icon(
+                download_info.category) if download_info.category else get_icon("file")
+            # TODO: Maybe override icon based on status (e.g., error icon)
+
+            # --- Create Table Items ---
+            # Col 0: File Name
+            file_item = QTableWidgetItem(
+                icon, download_info.file_name or "(Waiting for name...)")
+            # Store the actual DownloadInfo object with the first column item
+            file_item.setData(Qt.ItemDataRole.UserRole, download_info)
+            file_item.setToolTip(
+                # Add tooltip
+                f"URL: {download_info.url}\nID: {download_info.id}")
+            self.table_widget.setItem(row_idx, 0, file_item)
+
+            # Col 1: Size
+            size_item = QTableWidgetItem(
+                format_size(download_info.file_size_bytes))
+            size_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Store numerical data for sorting
+            size_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.file_size_bytes if download_info.file_size_bytes is not None else -1)
+            self.table_widget.setItem(row_idx, 1, size_item)
+
+            # Col 2: Status
+            status_item = QTableWidgetItem(download_info.status or "N/A")
+            self.table_widget.setItem(row_idx, 2, status_item)
+
+            # Col 3: Time Left
+            time_left_item = QTableWidgetItem(
+                format_time(download_info.time_left_seconds))
+            time_left_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Store numerical data for sorting (use -1 for N/A or infinite)
+            time_left_item.setData(
+                Qt.ItemDataRole.UserRole+1, download_info.time_left_seconds if download_info.time_left_seconds is not None and download_info.time_left_seconds >= 0 else -1)
+            self.table_widget.setItem(row_idx, 3, time_left_item)
+
+            # Col 4: Transfer Rate
+            rate_item = QTableWidgetItem(
+                format_speed(download_info.transfer_rate_bps))
+            rate_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Store numerical data for sorting
+            rate_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.transfer_rate_bps or 0)
+            self.table_widget.setItem(row_idx, 4, rate_item)
+
+            # Col 5: Last Try Date
+            last_try_str = download_info.last_try_date.strftime(
+                "%Y-%m-%d %H:%M:%S") if download_info.last_try_date else ""
+            date_item = QTableWidgetItem(last_try_str)
+            # Store numerical data for sorting (Unix timestamp)
+            date_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.last_try_date.timestamp() if download_info.last_try_date else 0)
+            self.table_widget.setItem(row_idx, 5, date_item)
+
+            # Col 6: Queue
+            queue_item = QTableWidgetItem(download_info.queue_name or "N/A")
+            self.table_widget.setItem(row_idx, 6, queue_item)
+
+            # Col 7: Description
+            desc_item = QTableWidgetItem(download_info.description or "")
+            self.table_widget.setItem(row_idx, 7, desc_item)
+
+        # --- Re-enable sorting and restore previous indicator ---
+        self.table_widget.setSortingEnabled(True)
+        if current_sort_column != -1:
+            self.table_widget.sortByColumn(
+                current_sort_column, current_sort_order)
+
+    def _connect_signals(self):
+        """Connect GUI signals to slots."""
+        # Toolbar actions
+        for key, action in self.actions.items():
+            # Find method like _add_url
+            slot_method = getattr(self, f"_{key}", None)
+            if callable(slot_method):
+                action.triggered.connect(slot_method)
+            else:
+                # Connect to a generic placeholder
+                action.triggered.connect(
+                    lambda checked=False, k=key: self._placeholder_slot(k))
+
+        # Widget signals
+        self.tree_widget.currentItemChanged.connect(self._category_selected)
+        self.table_widget.itemSelectionChanged.connect(
+            self._update_toolbar_state)
+        self.table_widget.customContextMenuRequested.connect(
+            self._show_table_context_menu)
+        self.table_widget.itemDoubleClicked.connect(
+            self._show_download_progress)
+
+        # Category Tree Queue Management Signals
+        self.tree_widget.queue_add_requested.connect(self._add_queue)
+        self.tree_widget.queue_rename_requested.connect(self._rename_queue)
+        self.tree_widget.queue_delete_requested.connect(self._delete_queue)
+
+    # --- Action Handlers ---
+
+    @Slot()
+    def _add_url(self):
+        url, ok = QInputDialog.getText(
+            self, "Add New Download", "Enter URL:", QLineEdit.EchoMode.Normal)
+        if ok and url:
+            url = url.strip()
+            if not url:
+                QMessageBox.warning(self, "Invalid URL",
+                                    "URL cannot be empty.")
+                return
+
+            # Basic check if URL seems valid (very simple)
+            if not (url.startswith("http://") or url.startswith("https://") or url.startswith("ftp://")):
+                QMessageBox.warning(
+                    self, "Invalid URL", "Please enter a valid URL (starting with http, https, or ftp).")
+                return
+
+            print(f"Action: Add URL requested: {url}")
+
+            # Create new download item
+            new_download = DownloadInfo(url=url)
+            new_download.status = "Queued"
+            new_download.queue_name = "Main"  # Default queue
+            new_download.creation_date = datetime.datetime.now()
+            # Extract potential filename (basic)
+            try:
+                # A slightly more robust way to get filename from URL path
+                from urllib.parse import urlparse, unquote
+                parsed_url = urlparse(url)
+                path = unquote(parsed_url.path)  # Decode URL encoding like %20
+                new_download.file_name = os.path.basename(path)
+                if not new_download.file_name:  # Handle URLs ending in / or just domain
+                    # Attempt to get from Content-Disposition later, use placeholder for now
+                    new_download.file_name = f"download_{new_download.id[:8]}"
+            except Exception as e:
+                print(f"Error parsing filename from URL: {e}")
+                # Fallback name
+                new_download.file_name = f"download_{new_download.id[:8]}"
+
+            # TODO: Add a pre-download info dialog here (like IDM)
+            # This dialog would fetch file size, check resume support,
+            # allow setting save path, queue, description, category etc.
+            # For now, just add directly to the list.
+
+            self.downloads.append(new_download)
+            self._populate_table()  # Refresh table view
+            self._select_last_row()  # Select the newly added row
+            print(
+                f"Added download {new_download.id} ('{new_download.file_name}') to queue '{new_download.queue_name}'")
+        else:
+            print("Action: Add URL cancelled")
+
+    @Slot()
+    def _resume(self):
+        selected_downloads = self._get_selected_download_items()
+        if selected_downloads:
+            print(f"Action: Resume {len(selected_downloads)} download(s)")
+            resumed_count = 0
+            for item in selected_downloads:
+                item_status_lower = (item.status or "").lower()
+                # Check if resumable (based on status and capability)
+                # Allow resuming from Queued as well (effectively starting it)
+                can_resume = item.resume_capability and (
+                    "paused" in item_status_lower or "error" in item_status_lower or "stopped" in item_status_lower)
+                can_start = "queued" in item_status_lower
+
+                if can_resume or can_start:
+                    print(
+                        f"  > Resuming/Starting {item.id} ({item.file_name})")
+                    # --- TODO: Signal download controller to resume/start item.id ---
+                    item.status = "Connecting..."  # Simulate immediate feedback
+                    resumed_count += 1
+                else:
+                    print(
+                        f"  > Cannot resume {item.id} (Status: {item.status}, Resume Capable: {item.resume_capability})")
+
+            if resumed_count > 0:
+                self._populate_table()  # Refresh table to show status change
+                self._update_toolbar_state()  # Update button states
+                QMessageBox.information(
+                    self, "Action", f"Attempting to resume/start {resumed_count} download(s).")
+            else:
+                QMessageBox.warning(
+                    self, "Action", "No selected downloads could be resumed or started.")
+
+        else:
+            print("  No selection")
+
+    @Slot()
+    def _stop(self):
+        selected_downloads = self._get_selected_download_items()
+        if selected_downloads:
+            print(f"Action: Stop {len(selected_downloads)} download(s)")
+            stopped_count = 0
+            for item in selected_downloads:
+                item_status_lower = (item.status or "").lower()
+                # Check if stoppable
+                can_stop = "downloading" in item_status_lower or "receiving" in item_status_lower or "connecting" in item_status_lower or "queued" in item_status_lower
+                if can_stop:
+                    print(f"  > Stopping {item.id} ({item.file_name})")
+                    # --- TODO: Signal download controller to stop item.id ---
+                    item.status = "Stopped"  # Simulate immediate feedback
+                    item.transfer_rate_bps = 0
+                    item.time_left_seconds = -1
+                    stopped_count += 1
+                else:
+                    print(f"  > Cannot stop {item.id} (Status: {item.status})")
+
+            if stopped_count > 0:
+                self._populate_table()  # Refresh table
+                self._update_toolbar_state()
+                QMessageBox.information(
+                    self, "Action", f"Attempting to stop {stopped_count} download(s).")
+            else:
+                QMessageBox.warning(
+                    self, "Action", "No selected downloads could be stopped (they might be already paused, finished, or in error state).")
+        else:
+            print("  No selection")
+
+    @Slot()
+    def _stop_all(self):
+        print("Action: Stop All")
+        stopped_count = 0
+        for item in self.downloads:
+            item_status_lower = (item.status or "").lower()
+            can_stop = "downloading" in item_status_lower or "receiving" in item_status_lower or "connecting" in item_status_lower or "queued" in item_status_lower
+            if can_stop:
+                # --- TODO: Signal download controller to stop item.id ---
+                item.status = "Stopped"
+                item.transfer_rate_bps = 0
+                item.time_left_seconds = -1
+                stopped_count += 1
+        if stopped_count > 0:
+            self._populate_table()
+            self._update_toolbar_state()
+            QMessageBox.information(
+                self, "Action", f"Attempted to stop {stopped_count} active/queued download(s).")
+        else:
+            QMessageBox.information(
+                self, "Action", "No active or queued downloads to stop.")
+
+    @Slot()
+    def _delete(self):
+        selected_items_data = self._get_selected_download_items()  # Get the data objects
+        if selected_items_data:
+            count = len(selected_items_data)
+            reply = QMessageBox.question(self, "Confirm Delete",
+                                         f"Are you sure you want to remove {count} selected download(s) from the list?\n(This will NOT delete files from your disk).",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                print(f"  Deleting {count} items...")
+                ids_to_delete = {item.id for item in selected_items_data}
+
+                # --- TODO: Signal download controller to STOP these downloads first if active ---
+                for item in selected_items_data:
+                    item_status_lower = (item.status or "").lower()
+                    if "downloading" in item_status_lower or "receiving" in item_status_lower or "connecting" in item_status_lower:
+                        print(f"    (Stopping {item.id} before delete)")
+                        # Signal stop here
+
+                # Remove items from the main list
+                self.downloads = [
+                    d for d in self.downloads if d.id not in ids_to_delete]
+
+                self._populate_table()  # Refresh the table
+                self._update_toolbar_state()  # Update buttons
+                print(f"  Deleted {count} items.")
+            else:
+                print("  Deletion cancelled")
+        else:
+            print("  No selection to delete")
+
+    @Slot()
+    def _options(self):
+        print("Action: Options")
+        QMessageBox.information(
+            self, "Action", "Options clicked (implement dialog)")
+
+    @Slot()
+    def _scheduler(self):
+        print("Action: Scheduler")
+        QMessageBox.information(
+            self, "Action", "Scheduler clicked (implement dialog)")
+
+    @Slot()
+    def _start_q(self):
+        selected_queue = self.tree_widget.get_selected_queue_name()
+        if selected_queue:
+            print(f"Action: Start Queue '{selected_queue}'")
+            # --- TODO: Implement queue starting logic ---
+            # Iterate downloads in this queue, find 'Queued' or 'Stopped' ones, signal controller to start them (up to concurrent limit)
+            started_count = 0
+            for item in self.downloads:
+                if item.queue_name == selected_queue:
+                    item_status_lower = (item.status or "").lower()
+                    if "queued" in item_status_lower or "stopped" in item_status_lower:
+                        # Signal start for item.id
+                        item.status = "Connecting..."  # Simulate
+                        started_count += 1
+                        # Break if concurrent limit reached?
+            if started_count > 0:
+                self._populate_table()
+                self._update_toolbar_state()
+                QMessageBox.information(
+                    self, "Action", f"Attempting to start {started_count} downloads in queue '{selected_queue}'.")
+            else:
+                QMessageBox.information(
+                    self, "Action", f"No downloads to start in queue '{selected_queue}'.")
+        else:
+            QMessageBox.warning(
+                self, "Action", "Please select a queue in the category tree first.")
+
+    @Slot()
+    def _stop_q(self):
+        selected_queue = self.tree_widget.get_selected_queue_name()
+        if selected_queue:
+            print(f"Action: Stop Queue '{selected_queue}'")
+            # --- TODO: Implement queue stopping logic ---
+            # Iterate downloads in this queue, find active ones, signal controller to stop them. Maybe change status to 'Stopped' or 'Paused'.
+            stopped_count = 0
+            for item in self.downloads:
+                if item.queue_name == selected_queue:
+                    item_status_lower = (item.status or "").lower()
+                    if "downloading" in item_status_lower or "receiving" in item_status_lower or "connecting" in item_status_lower or "queued" in item_status_lower:
+                        # Signal stop for item.id
+                        item.status = "Stopped"  # Simulate
+                        item.transfer_rate_bps = 0
+                        item.time_left_seconds = -1
+                        stopped_count += 1
+            if stopped_count > 0:
+                self._populate_table()
+                self._update_toolbar_state()
+                QMessageBox.information(
+                    self, "Action", f"Attempting to stop {stopped_count} downloads in queue '{selected_queue}'.")
+            else:
+                QMessageBox.information(
+                    self, "Action", f"No active or queued downloads to stop in queue '{selected_queue}'.")
+        else:
+            QMessageBox.warning(
+                self, "Action", "Please select a queue in the category tree first.")
+
+    @Slot()
+    def _grabber(self):
+        print("Action: Grabber")
+        QMessageBox.information(
+            self, "Action", "Grabber clicked (implement dialog)")
+
+    @Slot(str)
+    def _placeholder_slot(self, action_key):
+        print(f"Action: {action_key} (placeholder)")
+        QMessageBox.information(
+            self, "Action", f"{action_key} clicked (not implemented yet)")
+
+    # --- UI Update/Interaction Slots ---
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _category_selected(self, current, previous):
+        if current:
+            key, type = self.tree_widget.get_selected_item_data()
+            print(
+                f"Category/Queue selected: {current.text(0)} (Key: {key}, Type: {type})")
+            self._populate_table()  # Re-filter and populate the table
+            self.table_widget.clearSelection()  # Clear selection when filter changes
+            self._update_toolbar_state()  # Update buttons based on selection/filter
+        else:
+            # Should not happen with default selection logic, but handle defensively
+            print("Category selection cleared")
+            self._populate_table()  # Show all
+
+    @Slot()
+    def _update_toolbar_state(self):
+        selected_items = self._get_selected_download_items()
+        has_selection = bool(selected_items)
+        can_resume_any = False
+        can_stop_any = False
+
+        if has_selection:
+            for item in selected_items:
+                status_lower = (item.status or "").lower()
+                # Check if resumable/startable
+                is_paused_error_stopped = "paused" in status_lower or "error" in status_lower or "stopped" in status_lower
+                is_queued = "queued" in status_lower
+                if (item.resume_capability and is_paused_error_stopped) or is_queued:
+                    can_resume_any = True
+                # Check if stoppable
+                if "downloading" in status_lower or "receiving" in status_lower or "connecting" in status_lower or is_queued:
+                    can_stop_any = True
+                # If we found one of each, no need to check further
+                if can_resume_any and can_stop_any:
+                    break
+
+        self.actions["resume"].setEnabled(can_resume_any)
+        self.actions["stop"].setEnabled(can_stop_any)
+        self.actions["delete"].setEnabled(has_selection)
+
+        # Enable Queue actions based on tree selection
+        selected_queue = self.tree_widget.get_selected_queue_name()
+        self.actions["start_q"].setEnabled(bool(selected_queue))
+        self.actions["stop_q"].setEnabled(bool(selected_queue))
+
+    @Slot(QPoint)
+    def _show_table_context_menu(self, pos):
+        selected_items_data = self._get_selected_download_items()
+        if not selected_items_data:
+            # Maybe show a context menu even with no selection?
+            # E.g., to add URL or manage queues?
+            # For now, only show if items are selected.
+            return
+
+        global_pos = self.table_widget.mapToGlobal(pos)
+        context_menu = QMenu(self)
+
+        # --- Standard Actions (use existing QAction objects) ---
+        # Only add actions if they are relevant/enabled based on current selection state
+        if self.actions["resume"].isEnabled():
+            context_menu.addAction(self.actions["resume"])
+        if self.actions["stop"].isEnabled():
+            context_menu.addAction(self.actions["stop"])
+        context_menu.addSeparator()
+        if self.actions["delete"].isEnabled():
+            context_menu.addAction(self.actions["delete"])
+        context_menu.addSeparator()
+
+        # --- Item Specific Actions ---
+        open_folder_action = context_menu.addAction(
+            get_icon("folder"), "Open Containing Folder")
+        properties_action = context_menu.addAction(
+            get_icon("options"), "Properties...")  # Re-use options icon
+        move_to_queue_menu = context_menu.addMenu("Move to Queue")
+
+        is_single_selection = len(selected_items_data) == 1
+
+        # Enable/Disable based on current state and selection count
+        open_folder_action.setEnabled(
+            is_single_selection)  # Only for single item
+        properties_action.setEnabled(
+            is_single_selection)  # Only for single item
+
+        # --- Populate Move to Queue Submenu ---
+        # Only show if more than one queue exists
+        if self.queues and len(self.queues) > 1:
+            for queue_name in sorted(self.queues.keys()):
+                # Don't offer to move to the *same* queue if only one item selected
+                if is_single_selection and selected_items_data[0].queue_name == queue_name:
+                    continue
+
+                move_action = move_to_queue_menu.addAction(queue_name)
+                # Use lambda with default argument to capture queue_name
+                move_action.triggered.connect(
+                    lambda checked=False, qn=queue_name: self._move_selected_to_queue(qn))
+        else:
+            move_to_queue_menu.setEnabled(False)
+
+        # --- Connect signals for item-specific actions ---
+        # Check if action was added before connecting
+        if open_folder_action.isEnabled():
+            open_folder_action.triggered.connect(self._open_folder_selected)
+        if properties_action.isEnabled():
+            properties_action.triggered.connect(self._show_properties_selected)
+
+        if menu.actions():  # Only show menu if there's something in it
+            menu.exec(global_pos)
+
+    # --- Slot for Double Click ---
+    @Slot(QTableWidgetItem)
+    def _show_download_progress(self, item):
+        """Shows the detailed progress/properties dialog for the double-clicked item."""
+        if not item:
+            return
+        # Get the data stored in the first column of the clicked row
+        download_data = self._get_download_item_from_row(item.row())
+
+        if download_data:
+            # --- TODO: In a real app, this dialog should be non-modal ---
+            # --- and update dynamically based on signals from the downloader ---
+            # --- For now, exec() makes it modal ---
+            dialog = DownloadProgressDialog(download_data, self)
+            result = dialog.exec()  # Can check result if needed (Accepted/Rejected)
+
+            # After the dialog closes (if modal), refresh the row in case state changed
+            # This is a workaround for the dialog simulating state changes.
+            # In a real app, the main window would receive state updates from the downloader.
+            self._refresh_row(item.row())  # Refresh only the affected row
+            # self._populate_table() # Or refresh the whole table
+            self._update_toolbar_state()  # Toolbar state might depend on changed status
+        else:
+            print(
+                f"Warning: Could not find detailed DownloadInfo for double-clicked row: {item.row()}")
+            QMessageBox.information(
+                self, "Info", "No detailed download information available for this item.")
+
+    # --- Queue Management Slots (connected from CategoryTree signals) ---
+
+    @Slot(str)
+    def _add_queue(self, name):
+        name = name.strip()  # Remove leading/trailing whitespace
+        if not name:
+            QMessageBox.warning(self, "Invalid Name",
+                                "Queue name cannot be empty.")
+            return
+        if name in self.queues:
+            QMessageBox.warning(self, "Queue Exists",
+                                f"A queue named '{name}' already exists.")
+            return
+
+        print(f"Action: Add Queue '{name}'")
+        self.queues[name] = {}  # Add to our dictionary
+        new_item = self.tree_widget.add_queue_item(name)  # Update the tree UI
+
+        # Optionally select the new queue in the tree
+        if new_item:
+            self.tree_widget.setCurrentItem(new_item)
+
+    @Slot(str, str)
+    def _rename_queue(self, old_name, new_name):
+        new_name = new_name.strip()
+        if old_name == "Main":
+            QMessageBox.warning(self, "Cannot Rename",
+                                "The 'Main' queue cannot be renamed.")
+            return
+        if not new_name:
+            QMessageBox.warning(self, "Invalid Name",
+                                "Queue name cannot be empty.")
+            return
+        if new_name == old_name:
+            return  # No change
+        if new_name in self.queues:
+            QMessageBox.warning(self, "Queue Exists",
+                                f"A queue named '{new_name}' already exists.")
+            return
+        if old_name not in self.queues:
+            print(f"Warning: Tried to rename non-existent queue '{old_name}'")
+            return  # Should not happen if called from context menu
+
+        print(f"Action: Rename Queue '{old_name}' to '{new_name}'")
+        # Update our dictionary
+        self.queues[new_name] = self.queues.pop(old_name)
+        # Update downloads assigned to the old queue
+        for download in self.downloads:
+            if download.queue_name == old_name:
+                download.queue_name = new_name
+        # Update the tree UI
+        self.tree_widget.rename_queue_item(old_name, new_name)
+        # Refresh table if the renamed queue was selected or affected downloads are visible
+        self._populate_table()
+
+    @Slot(str)
+    def _delete_queue(self, name):
+        if name == "Main":
+            QMessageBox.warning(self, "Cannot Delete",
+                                "The 'Main' queue cannot be deleted.")
+            return
+        if name not in self.queues:
+            print(f"Warning: Tried to delete non-existent queue '{name}'")
+            return  # Should not happen
+
+        print(f"Action: Delete Queue '{name}'")
+        # Remove from our dictionary
+        del self.queues[name]
+        # Reassign downloads from this queue to "Main"
+        moved_count = 0
+        for download in self.downloads:
+            if download.queue_name == name:
+                download.queue_name = "Main"
+                moved_count += 1
+        print(f"  Moved {moved_count} downloads from '{name}' to 'Main'.")
+
+        was_selected = False
+        selected_item = self.tree_widget.currentItem()
+        if selected_item and selected_item.data(0, Qt.ItemDataRole.UserRole) == name:
+            was_selected = True
+
+        # Remove from tree UI
+        self.tree_widget.remove_queue_item(name)
+
+        # If the deleted queue was selected, select the "Queues" root or "Main"
+        if was_selected:
+            main_q_item = self.tree_widget.queue_items.get("Main")
+            if main_q_item:
+                self.tree_widget.setCurrentItem(main_q_item)
+            elif self.tree_widget.queues_root_item:
+                self.tree_widget.setCurrentItem(
+                    self.tree_widget.queues_root_item)
+
+        # Refresh table as download queue names changed and category might be gone
+        # Table will be repopulated automatically if selection changes due to setCurrentItem above
+        # Otherwise, force repopulate
+        if not was_selected:
+            self._populate_table()
+
+    # --- Helper methods ---
+
+    def _get_selected_rows(self):
+        """Returns a sorted list of unique selected row indices."""
+        return sorted(list(set(index.row() for index in self.table_widget.selectedIndexes())))
+
+    def _get_download_item_from_row(self, row_index):
+        """Gets the DownloadInfo object associated with a specific table row."""
+        if 0 <= row_index < self.table_widget.rowCount():
+            first_column_item = self.table_widget.item(row_index, 0)
+            if first_column_item:
+                data = first_column_item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, DownloadInfo):
+                    return data
+        return None
+
+    def _get_selected_download_items(self):
+        """Gets a list of DownloadInfo objects for the currently selected rows."""
+        selected_items = []
+        rows = self._get_selected_rows()
+        for row in rows:
+            item_data = self._get_download_item_from_row(row)
+            if item_data:
+                selected_items.append(item_data)
+        return selected_items
+
+    def _select_last_row(self):
+        """Selects the last row in the table, useful after adding an item."""
+        last_row = self.table_widget.rowCount() - 1
+        if last_row >= 0:
+            # Clear existing selection before selecting the new row
+            self.table_widget.clearSelection()
+            self.table_widget.selectRow(last_row)
+            # Ensure the row is visible
+            self.table_widget.scrollToItem(self.table_widget.item(
+                last_row, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _refresh_row(self, row_index):
+        """Refreshes the display of a single row in the table."""
+        download_info = self._get_download_item_from_row(row_index)
+        if not download_info or row_index < 0 or row_index >= self.table_widget.rowCount():
+            return  # Item not found or invalid index
+
+        # Temporarily disable sorting for the update
+        sorting_enabled = self.table_widget.isSortingEnabled()
+        self.table_widget.setSortingEnabled(False)
+
+        # --- Re-populate items for the specific row ---
+        icon = get_icon(
+            download_info.category) if download_info.category else get_icon("file")
+        file_item = self.table_widget.item(row_index, 0)
+        if file_item:
+            file_item.setIcon(icon)
+            file_item.setText(
+                download_info.file_name or "(Waiting for name...)")
+            file_item.setToolTip(
+                f"URL: {download_info.url}\nID: {download_info.id}")
+        # No need to reset UserRole data as it's the same object
+
+        size_item = self.table_widget.item(row_index, 1)
+        if size_item:
+            size_item.setText(format_size(download_info.file_size_bytes))
+            size_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.file_size_bytes if download_info.file_size_bytes is not None else -1)
+
+        status_item = self.table_widget.item(row_index, 2)
+        if status_item:
+            status_item.setText(download_info.status or "N/A")
+
+        time_left_item = self.table_widget.item(row_index, 3)
+        if time_left_item:
+            time_left_item.setText(format_time(
+                download_info.time_left_seconds))
+            time_left_item.setData(
+                Qt.ItemDataRole.UserRole+1, download_info.time_left_seconds if download_info.time_left_seconds is not None and download_info.time_left_seconds >= 0 else -1)
+
+        rate_item = self.table_widget.item(row_index, 4)
+        if rate_item:
+            rate_item.setText(format_speed(download_info.transfer_rate_bps))
+            rate_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.transfer_rate_bps or 0)
+
+        date_item = self.table_widget.item(row_index, 5)
+        if date_item:
+            last_try_str = download_info.last_try_date.strftime(
+                "%Y-%m-%d %H:%M:%S") if download_info.last_try_date else ""
+            date_item.setText(last_try_str)
+            date_item.setData(Qt.ItemDataRole.UserRole+1,
+                              download_info.last_try_date.timestamp() if download_info.last_try_date else 0)
+
+        queue_item = self.table_widget.item(row_index, 6)
+        if queue_item:
+            queue_item.setText(download_info.queue_name or "N/A")
+
+        desc_item = self.table_widget.item(row_index, 7)
+        if desc_item:
+            desc_item.setText(download_info.description or "")
+
+        # Restore sorting
+        self.table_widget.setSortingEnabled(sorting_enabled)
+
+    def _update_category_tree_queues(self):
+        """Updates the category tree with the current list of queues."""
+        self.tree_widget.update_queues(list(self.queues.keys()))
+
+    @Slot()
+    def _open_folder_selected(self):
+        selected_items = self._get_selected_download_items()
+        if len(selected_items) == 1:
+            item = selected_items[0]
+            print(f"Context Action: Open Folder for {item.id}")
+            # --- TODO: Implement logic to open the folder ---
+            # save_path = item.save_path
+            # if save_path and os.path.exists(save_path):
+            #    # Use QDesktopServices.openUrl(QUrl.fromLocalFile(save_path))
+            #    QMessageBox.information(self, "Action", f"Would open folder: {save_path}")
+            # else:
+            #    QMessageBox.warning(self, "Action", "Save path not set or does not exist.")
+            QMessageBox.information(
+                self, "Action", f"Open folder for '{item.file_name}' (Not implemented)")
+
+        else:
+            print("  Cannot open folder: Select a single item.")
+
+    @Slot()
+    def _show_properties_selected(self):
+        selected_items = self._get_selected_download_items()
+        if len(selected_items) == 1:
+            item_data = selected_items[0]
+            print(f"Context Action: Show Properties for {item_data.id}")
+            # Reuse the progress dialog as a properties dialog
+            dialog = DownloadProgressDialog(item_data, self)
+            dialog.exec()
+            # Refresh the row after dialog closes
+            row_index = self._find_row_for_item(item_data)
+            if row_index is not None:
+                self._refresh_row(row_index)
+            self._update_toolbar_state()
+        else:
+            print("  Cannot show properties: Select a single item.")
+
+    def _find_row_for_item(self, item_to_find: DownloadInfo):
+        """Finds the table row index for a given DownloadInfo object."""
+        for row in range(self.table_widget.rowCount()):
+            item_data = self._get_download_item_from_row(row)
+            if item_data and item_data.id == item_to_find.id:
+                return row
+        return None
+
+    @Slot(str)
+    def _move_selected_to_queue(self, target_queue_name):
+        """Moves selected downloads to the specified queue."""
+        selected_items = self._get_selected_download_items()
+        if not selected_items:
+            return
+        if target_queue_name not in self.queues:
+            print(
+                f"Warning: Target queue '{target_queue_name}' does not exist.")
+            return
+
+        print(
+            f"Action: Move {len(selected_items)} items to queue '{target_queue_name}'")
+        moved_count = 0
+        rows_to_potentially_remove = []  # If current filter is a specific queue
+        current_key, current_type = self.tree_widget.get_selected_item_data()
+        is_filtered_by_queue = current_type == "queue"
+
+        for item in selected_items:
+            if item.queue_name != target_queue_name:
+                print(
+                    f"  > Moving {item.id} ('{item.file_name}') from '{item.queue_name}' to '{target_queue_name}'")
+                item.queue_name = target_queue_name
+                moved_count += 1
+                # Find the row for update or removal
+                row_index = self._find_row_for_item(item)
+                if row_index is not None:
+                    if is_filtered_by_queue and item.queue_name != current_key:
+                        rows_to_potentially_remove.append(row_index)
+                    else:
+                        # Update the queue column directly if not removing row
+                        queue_item = self.table_widget.item(row_index, 6)
+                        if queue_item:
+                            queue_item.setText(target_queue_name)
+
+        if moved_count > 0:
+            # If rows were moved *out* of the currently filtered queue, refresh the whole table
+            if rows_to_potentially_remove:
+                print(f"  Items moved out of current filter view, refreshing table.")
+                self._populate_table()
+            # No need to update toolbar state here, as it's usually called on selection change
+
+        print(f"  Finished moving {moved_count} items.")
+--- END FILE: open-idm/main_window.py ---
+
+
+--- START FILE: open-idm/ui_utils/__init__.py ---
+--- END FILE: open-idm/ui_utils/__init__.py ---
+
+
+--- START FILE: open-idm/ui_utils/icons.py ---
+from PySide6.QtWidgets import QApplication, QStyle
+from PySide6.QtGui import QPixmap, QIcon
+from PySide6.QtCore import Qt
+
+
+def get_icon(name):
+    # Try to use standard Qt icons for common actions
+    # Using more common/guaranteed icons for better compatibility
+    standard_icons = {
+        # Often looks like '+' or new folder
+        "add": QStyle.StandardPixmap.SP_FileDialogNewFolder,
+        "resume": QStyle.StandardPixmap.SP_MediaPlay,
+        "stop": QStyle.StandardPixmap.SP_MediaStop,
+        "stop_all": QStyle.StandardPixmap.SP_BrowserStop,
+        "delete": QStyle.StandardPixmap.SP_TrashIcon,
+        # Generic icon for settings/options
+        "options": QStyle.StandardPixmap.SP_ComputerIcon,
+        # Placeholder, needs better icon eventually
+        "schedule": QStyle.StandardPixmap.SP_DialogYesButton,
+        "start_q": QStyle.StandardPixmap.SP_MediaSeekForward,
+        "stop_q": QStyle.StandardPixmap.SP_MediaPause,
+        "grabber": QStyle.StandardPixmap.SP_ArrowDown,
+        "folder": QStyle.StandardPixmap.SP_DirIcon,
+        "file": QStyle.StandardPixmap.SP_FileIcon,
+        "music": QStyle.StandardPixmap.SP_MediaVolume,
+        "video": QStyle.StandardPixmap.SP_MediaPlay,  # Safer choice
+        "program": QStyle.StandardPixmap.SP_ComputerIcon,  # Safer choice
+        # *** FIXED: Using SP_FileIcon instead of SP_DriveHarddiskIcon ***
+        "compressed": QStyle.StandardPixmap.SP_FileIcon,
+        "document": QStyle.StandardPixmap.SP_FileIcon,
+        "unfinished": QStyle.StandardPixmap.SP_DialogCancelButton,
+        "finished": QStyle.StandardPixmap.SP_DialogApplyButton,
+        "grabber_proj": QStyle.StandardPixmap.SP_ArrowDown,
+        "queues": QStyle.StandardPixmap.SP_DirIcon,  # Root queue node
+        # Individual queue node - safer than SP_DirLinkIcon
+        "queue": QStyle.StandardPixmap.SP_DirIcon,
+        "exe": QStyle.StandardPixmap.SP_ComputerIcon,
+        # Placeholder for rename/edit
+        "edit": QStyle.StandardPixmap.SP_FileDialogDetailedView
+    }
+
+    if name in standard_icons:
+        try:
+            # Attempt to get the actual standard icon from the style
+            app_instance = QApplication.instance()
+            if app_instance:
+                style = app_instance.style()
+                icon = style.standardIcon(standard_icons[name])
+                if not icon.isNull():
+                    return icon
+        except Exception as e:
+            # Print warning if fails
+            print(f"Warning: Could not load standard icon '{name}': {e}")
+            pass  # Fallback to colored square
+
+    # Fallback to a simple colored square if standard icon not found/suitable
+    pixmap = QPixmap(16, 16)
+    colors = {
+        "add": Qt.GlobalColor.blue, "resume": Qt.GlobalColor.green, "stop": Qt.GlobalColor.red,
+        "stop_all": Qt.GlobalColor.darkRed, "delete": Qt.GlobalColor.magenta, "options": Qt.GlobalColor.gray,
+        "schedule": Qt.GlobalColor.cyan, "start_q": Qt.GlobalColor.darkGreen, "stop_q": Qt.GlobalColor.darkYellow,
+        "grabber": Qt.GlobalColor.darkBlue,
+        "folder": Qt.GlobalColor.yellow, "file": Qt.GlobalColor.white,
+        "music": Qt.GlobalColor.lightGray, "video": Qt.GlobalColor.blue, "program": Qt.GlobalColor.darkGray,
+        "compressed": Qt.GlobalColor.green, "document": Qt.GlobalColor.white,
+        "unfinished": Qt.GlobalColor.red, "finished": Qt.GlobalColor.green,
+        "grabber_proj": Qt.GlobalColor.darkBlue, "queues": Qt.GlobalColor.darkYellow, "queue": Qt.GlobalColor.yellow,
+        "exe": Qt.GlobalColor.darkGray, "edit": Qt.GlobalColor.cyan
+    }
+    pixmap.fill(colors.get(name, Qt.GlobalColor.black))
+    return QIcon(pixmap)
+--- END FILE: open-idm/ui_utils/icons.py ---
+
+
+--- START FILE: open-idm/widgets/__init__.py ---
+--- END FILE: open-idm/widgets/__init__.py ---
+
+
+--- START FILE: open-idm/widgets/category_tree.py ---
+import uuid
+from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QMenu, QInputDialog, QMessageBox
+from PySide6.QtCore import Qt, Slot, Signal, QPoint
+from PySide6.QtGui import QAction
+from ui_utils.icons import get_icon
+
+
+class CategoryTree(QTreeWidget):
+    # Signal to request adding/removing/renaming queues
+    queue_add_requested = Signal(str)       # name
+    queue_rename_requested = Signal(str, str)  # old_name, new_name
+    queue_delete_requested = Signal(str)    # name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setMinimumWidth(180)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+        # Store references to key items
+        self.all_downloads_item = None
+        self.unfinished_item = None
+        self.finished_item = None
+        self.grabber_item = None
+        self.queues_root_item = None
+        self.queue_items = {}  # Map queue name -> QTreeWidgetItem
+
+        self._populate_base_tree()
+
+    def _create_item(self, parent, text, icon_name, data=None, is_queue=False):
+        item = QTreeWidgetItem(parent)
+        item.setText(0, text)
+        item.setIcon(0, get_icon(icon_name))
+        # Store data: category key or queue name
+        item.setData(0, Qt.ItemDataRole.UserRole,
+                     data if data else text.lower().replace(" ", "_"))
+        # Store whether it's a queue item for context menu logic
+        item.setData(1, Qt.ItemDataRole.UserRole, is_queue)
+        return item
+
+    def _populate_base_tree(self):
+        self.clear()
+        self.queue_items.clear()
+
+        # Main categories
+        self.all_downloads_item = self._create_item(
+            self, "All Downloads", "folder", "all")
+        self.unfinished_item = self._create_item(
+            self, "Unfinished", "unfinished", "unfinished")
+        self.finished_item = self._create_item(
+            self, "Finished", "finished", "finished")
+        self.grabber_item = self._create_item(
+            self, "Grabber projects", "grabber_proj", "grabber")
+        self.queues_root_item = self._create_item(
+            self, "Queues", "queues", "queues_root")  # Special key for root
+
+        # Sub-categories for All Downloads
+        self._create_item(self.all_downloads_item,
+                          "Compressed", "compressed", "compressed")
+        self._create_item(self.all_downloads_item,
+                          "Documents", "document", "document")
+        self._create_item(self.all_downloads_item, "Music", "music", "music")
+        self._create_item(self.all_downloads_item,
+                          "Programs", "program", "program")
+        self._create_item(self.all_downloads_item, "Video", "video", "video")
+
+        # Expand the main categories initially
+        self.all_downloads_item.setExpanded(True)
+        self.queues_root_item.setExpanded(True)
+
+        # Add checkmark to Finished (visual only)
+        self.finished_item.setText(0, "✔ Finished")
+
+    def add_queue_item(self, name):
+        """Adds a single queue item under the Queues root."""
+        if name not in self.queue_items and self.queues_root_item:
+            # Use a generic queue icon for now
+            item = self._create_item(
+                self.queues_root_item, name, "queue", name, is_queue=True)
+            self.queue_items[name] = item
+            return item
+        return None
+
+    def remove_queue_item(self, name):
+        """Removes a single queue item by name."""
+        if name in self.queue_items and self.queues_root_item:
+            item = self.queue_items.pop(name)
+            self.queues_root_item.removeChild(item)
+            # delete item? No, Qt handles it.
+
+    def rename_queue_item(self, old_name, new_name):
+        """Renames a queue item."""
+        if old_name in self.queue_items and new_name not in self.queue_items:
+            item = self.queue_items.pop(old_name)
+            item.setText(0, new_name)
+            item.setData(0, Qt.ItemDataRole.UserRole,
+                         new_name)  # Update data key
+            self.queue_items[new_name] = item
+
+    def update_queues(self, queue_names):
+        """Rebuilds the list of queue items under the 'Queues' node."""
+        if not self.queues_root_item:
+            return
+
+        # Remove old queue items that are no longer valid
+        current_queue_item_names = list(self.queue_items.keys())
+        for name in current_queue_item_names:
+            if name not in queue_names:
+                self.remove_queue_item(name)
+
+        # Add new queue items
+        for name in queue_names:
+            if name not in self.queue_items:
+                self.add_queue_item(name)
+
+        # Ensure correct order maybe? For now, just add/remove is fine.
+
+    def get_selected_item_data(self):
+        """Returns the data key and type ('category' or 'queue') of the currently selected item."""
+        selected_items = self.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            key = item.data(0, Qt.ItemDataRole.UserRole)
+            is_queue = item.data(1, Qt.ItemDataRole.UserRole)
+            item_type = "queue" if is_queue else "category"
+            # Handle the root queue item specifically
+            if key == "queues_root":
+                item_type = "category"  # Treat root like a category filter
+            return key, item_type
+        return None, None
+
+    @Slot(QPoint)
+    def _show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if not item:
+            return
+
+        key, item_type = self.get_selected_item_data()  # Use current selection data
+        if not key:
+            return  # Should not happen if item exists, but check anyway
+
+        menu = QMenu(self)
+        global_pos = self.mapToGlobal(pos)
+
+        is_user_queue = item_type == "queue" and key != "Main"
+        is_queues_root = key == "queues_root"
+
+        if is_queues_root or is_user_queue:
+            add_action = menu.addAction(get_icon("add"), "Add New Queue...")
+            add_action.triggered.connect(self._request_add_queue)
+
+        if is_user_queue:
+            rename_action = menu.addAction(
+                get_icon("edit"), "Rename Queue...")  # Need an 'edit' icon
+            rename_action.triggered.connect(
+                lambda: self._request_rename_queue(key))  # Pass current name
+
+            delete_action = menu.addAction(get_icon("delete"), "Delete Queue")
+            delete_action.triggered.connect(
+                lambda: self._request_delete_queue(key))  # Pass current name
+
+        if menu.actions():
+            menu.exec(global_pos)
+
+    @Slot()
+    def _request_add_queue(self):
+        new_name, ok = QInputDialog.getText(
+            self, "Add Queue", "Enter name for the new queue:")
+        if ok and new_name:
+            self.queue_add_requested.emit(new_name.strip())
+
+    @Slot()
+    def _request_rename_queue(self, old_name):
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Queue", f"Enter new name for queue '{old_name}':", text=old_name)
+        if ok and new_name and new_name.strip() != old_name:
+            self.queue_rename_requested.emit(old_name, new_name.strip())
+
+    @Slot()
+    def _request_delete_queue(self, name):
+        reply = QMessageBox.question(self, "Confirm Delete",
+                                     f"Are you sure you want to delete the queue '{name}'?\nDownloads in this queue will be moved to the 'Main' queue.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.queue_delete_requested.emit(name)
+
+    # Override selection getter for simplicity in main window
+    def get_selected_category_key(self):
+        key, type = self.get_selected_item_data()
+        # Only return if it's a category type
+        return key if type == 'category' else None
+
+    def get_selected_queue_name(self):
+        key, type = self.get_selected_item_data()
+        return key if type == 'queue' else None  # Only return if it's a queue type
+--- END FILE: open-idm/widgets/category_tree.py ---

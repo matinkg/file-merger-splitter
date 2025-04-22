@@ -11,21 +11,28 @@ os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
 # QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
 # QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
-# Import the main window class
-
 # --- Main Execution ---
 if __name__ == '__main__':
-    # Create the Qt Application
-    app = QApplication(sys.argv)
+    try:
+        # Create the Qt Application
+        app = QApplication(sys.argv)
 
-    # Set application details (optional but good practice)
-    app.setApplicationName("FileMergerSplitter")
-    app.setOrganizationName("UtilityApps")
-    app.setApplicationVersion("1.2")  # Keep version updated
+        # Set application details (optional but good practice)
+        app.setApplicationName("FileMergerSplitter")
+        app.setOrganizationName("UtilityApps")
+        app.setApplicationVersion("1.2")  # Keep version updated
 
-    # Create and show the main window
-    main_window = MergerSplitterApp()
-    main_window.show()
+        # Create and show the main window
+        main_window = MergerSplitterApp()
+        main_window.show()
 
-    # Start the Qt event loop
-    sys.exit(app.exec())
+        # Start the Qt event loop
+        sys.exit(app.exec())
+    except Exception as e:
+        # Handle any unexpected errors during startup
+        from PyQt6.QtWidgets import QMessageBox
+        error_msg = f"Error starting application: {str(e)}"
+        print(error_msg)  # Print to console
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(None, "Application Error", error_msg)
+        sys.exit(1)
