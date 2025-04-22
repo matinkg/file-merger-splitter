@@ -23,6 +23,7 @@ class FolderSelectionDialog(QDialog):
         super().__init__(parent)
         self.folder_path = pathlib.Path(
             folder_path_str).resolve()  # Resolve path immediately
+        # Will contain only ("file", path, base) tuples
         self._selected_items_for_worker = []
         self.gitignore_patterns = []  # Store parsed gitignore patterns
         self.gitignore_path = self.folder_path / ".gitignore"
@@ -217,12 +218,14 @@ class FolderSelectionDialog(QDialog):
                 # Need to handle root matching ('/') vs relative matching
                 dir_path_str_with_slash = path_to_match + '/'
                 if match_from_root:
-                    if fnmatch.fnmatchcase(dir_path_str_with_slash, match_pattern + '/'):
+                    # Use pattern/* to match dir and its contents
+                    if fnmatch.fnmatchcase(dir_path_str_with_slash, match_pattern + '/*'):
                         pattern_applies = True
                 else:  # Match anywhere in the path segments
                     # Check if any directory segment matches the pattern
                     # Or if the full path + slash matches the pattern + slash
-                    if fnmatch.fnmatchcase(dir_path_str_with_slash, '*' + match_pattern + '/'):
+                    # Use *pattern/* to match dir and its contents anywhere
+                    if fnmatch.fnmatchcase(dir_path_str_with_slash, '*' + match_pattern + '/*'):
                         pattern_applies = True
 
             # 2. File/Any Match (no trailing `/` in pattern)
@@ -232,19 +235,10 @@ class FolderSelectionDialog(QDialog):
                     if fnmatch.fnmatchcase(path_to_match, match_pattern):
                         pattern_applies = True
                 else:  # Match pattern anywhere in the path
-                    # Option A: Match against the basename
-                    # if fnmatch.fnmatchcase(relative_path_obj.name, match_pattern):
-                    #     pattern_applies = True
-                    # Option B: Match against the full path string (more like git)
-                    # Match anywhere
-                    if fnmatch.fnmatchcase(path_to_match, '*' + match_pattern):
-                        # More precise: Check if any component matches if no '/' in pattern
-                        if '/' not in pattern:
-                            pattern_applies = any(fnmatch.fnmatchcase(
-                                part, match_pattern) for part in relative_path_obj.parts)
-                        else:  # Pattern contains '/', match against full relative path
-                            pattern_applies = fnmatch.fnmatchcase(
-                                path_to_match, '*' + match_pattern)
+                    # Match pattern against the full path or just the file/dir name at the end
+                    if fnmatch.fnmatchcase(path_to_match, '*' + match_pattern) or \
+                       fnmatch.fnmatchcase(relative_path_obj.name, match_pattern):
+                        pattern_applies = True
 
             # Update ignore status based on match and negation
             if pattern_applies:
@@ -299,12 +293,9 @@ class FolderSelectionDialog(QDialog):
             try:
                 # Calculate path relative to the folder containing .gitignore
                 relative_path = absolute_path.relative_to(self.folder_path)
-                item_is_dir = item.data(TYPE_DATA_ROLE) == "folder"
-                # Augment relative path with is_dir status for matching logic
-                # This feels a bit hacky, maybe pass item type directly?
-                # Let's refine _matches_gitignore_pattern instead.
-                # Re-fetching is_dir from absolute path is safer
-                is_dir_check = absolute_path.is_dir()  # Check the actual file system item
+                # Fetch is_dir status from the actual file system item for matching logic
+                is_dir_check = absolute_path.is_dir()
+                # Pass the relative path object to the matching function
                 return self._matches_gitignore_pattern(relative_path)
             except ValueError:
                 print(
@@ -424,19 +415,26 @@ class FolderSelectionDialog(QDialog):
             # The change to the parent will trigger on_item_changed for the parent,
             # causing the update to propagate further up the chain (if needed).
 
+    # --- MODIFIED accept method ---
     def accept(self):
-        """Called when OK is clicked. Collects selected items before closing."""
+        """Called when OK is clicked. Collects selected *files* before closing."""
         self._selected_items_for_worker = []
         root = self.model.invisibleRootItem()
         # Use the parent of the initially selected folder as the base path
         # This ensures relative paths are consistent if the user selected Folder/Subfolder
         base_path_for_dialog_items = str(self.folder_path.parent.resolve())
-        self._collect_selected_items_recursive(
+        # Call the revised collection method
+        self._collect_selected_files_recursive(
             root, base_path_for_dialog_items)
         super().accept()  # Close the dialog with Accepted code
 
-    def _collect_selected_items_recursive(self, parent_item: QStandardItem, base_path_str: str):
-        """Recursively traverses the model to find checked or partially checked items."""
+    # --- RENAMED and REVISED Method ---
+    def _collect_selected_files_recursive(self, parent_item: QStandardItem, base_path_str: str):
+        """
+        Recursively traverses the model to find CHECKED FILES.
+        Recurses into CHECKED or PARTIALLY CHECKED folders.
+        Does NOT add folder items themselves to the list.
+        """
         for row in range(parent_item.rowCount()):
             item = parent_item.child(row, 0)
             if not item or not item.isCheckable():
@@ -446,25 +444,30 @@ class FolderSelectionDialog(QDialog):
             item_type = item.data(TYPE_DATA_ROLE)
             item_path_str = item.data(PATH_DATA_ROLE)
 
-            if not item_type or not item_path_str:  # Skip error items or improperly configured items
+            if not item_type or not item_path_str:  # Skip error items etc.
                 continue
 
-            # If fully checked, add it directly (whether file or folder)
-            # We now need to add folders *as folders* so the MergerWorker can scan them
-            if state == Qt.CheckState.Checked:
-                # Worker needs ('type', 'absolute_path', 'base_path_for_relativity')
-                self._selected_items_for_worker.append(
-                    # Pass the actual type ('file' or 'folder')
-                    (item_type, item_path_str, base_path_str))
-            # If partially checked, only recurse into folders
-            elif state == Qt.CheckState.PartiallyChecked:
-                if item_type == "folder":
-                    # Recurse deeper, passing the same base path
-                    self._collect_selected_items_recursive(item, base_path_str)
-            # If unchecked, ignore this item and its children
+            # --- Core Logic Change ---
+            if state == Qt.CheckState.Unchecked:
+                # If an item is unchecked, ignore it and its descendants entirely.
+                continue
+
+            # If the item is a FILE and CHECKED, add it to the list.
+            if item_type == "file":
+                if state == Qt.CheckState.Checked:
+                    # Worker needs ('type', 'absolute_path', 'base_path_for_relativity')
+                    self._selected_items_for_worker.append(
+                        ("file", item_path_str, base_path_str)
+                    )
+            # If the item is a FOLDER and is CHECKED or PARTIALLY CHECKED, recurse into it.
+            # Do *not* add the folder itself to the worker list.
+            elif item_type == "folder":
+                # state here can only be Checked or PartiallyChecked due to the Unchecked check above
+                self._collect_selected_files_recursive(item, base_path_str)
+            # --- End Core Logic Change ---
 
     def get_selected_items(self):
-        """Returns the list of selected items formatted for the MergerWorker."""
-        # Format: List[Tuple(type_str, path_str, base_path_str)]
-        # Ensure folders are passed as 'folder' type, not 'folder-root'
+        """Returns the list of selected *files* formatted for the MergerWorker."""
+        # Format: List[Tuple("file", path_str, base_path_str)]
+        # This list should now ONLY contain files after the fix above.
         return self._selected_items_for_worker
