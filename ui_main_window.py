@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QDialog, QTreeView, QDialogButtonBox, QScrollArea, QTabWidget, QSpacerItem,
     QComboBox, QCheckBox  # <--- Imported QCheckBox
 )
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QPalette, QColor
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QPalette, QColor, QFontDatabase
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QDir, QModelIndex
 )
@@ -20,6 +20,33 @@ from config import MERGE_FORMATS, PATH_DATA_ROLE, TYPE_DATA_ROLE, BASE_PATH_DATA
 # Ensure this uses updated workers.py
 from workers import MergerWorker, SplitterWorker
 from dialogs import FolderSelectionDialog
+
+
+# --- Text Viewer Dialog ---
+class TextViewerDialog(QDialog):
+    def __init__(self, text_content, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merged Text Output")
+        self.setMinimumSize(800, 600)
+        # Allow resizing and maximizing
+        self.setWindowFlags(self.windowFlags(
+        ) | Qt.WindowType.WindowMaximizeButtonHint | Qt.WindowType.WindowSystemMenuHint)
+
+        layout = QVBoxLayout(self)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setText(text_content)
+        # Use a monospace font for better code alignment
+        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self.text_edit.setFont(font)
+
+        layout.addWidget(self.text_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        # .rejected is the standard signal for "Cancel" or "Close"
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
 
 
 # --- Main Application Window ---
@@ -134,11 +161,14 @@ class MergerSplitterApp(QWidget):
         # Merge Action Buttons
         merge_actions_layout = QHBoxLayout()
         merge_actions_layout.addStretch()
-        self.merge_button = QPushButton(" Merge ")
+        self.merge_view_button = QPushButton(" View as Text ")
+        self.merge_view_button.setObjectName("MergeViewButton")
+        self.merge_button = QPushButton(" Merge to File ")
         self.merge_button.setObjectName("MergeButton")
         self.merge_cancel_button = QPushButton("Cancel")
         self.merge_cancel_button.setObjectName("MergeCancelButton")
         self.merge_cancel_button.setEnabled(False)  # Initially disabled
+        merge_actions_layout.addWidget(self.merge_view_button)
         merge_actions_layout.addWidget(self.merge_button)
         merge_actions_layout.addWidget(self.merge_cancel_button)
         merge_actions_layout.addStretch()
@@ -230,6 +260,7 @@ class MergerSplitterApp(QWidget):
         self.clear_list_button.clicked.connect(self.clear_item_list)
         self.select_output_merge_button.clicked.connect(
             self.select_output_merge_file)
+        self.merge_view_button.clicked.connect(self.start_merge_to_text)
         self.merge_button.clicked.connect(self.start_merge)
         self.merge_cancel_button.clicked.connect(self.cancel_operation)
         self.merge_format_combo.currentIndexChanged.connect(
@@ -279,6 +310,8 @@ class MergerSplitterApp(QWidget):
                 QStyle.StandardPixmap.SP_TrashIcon)  # Trash icon for remove
             clear_icon = style.standardIcon(
                 QStyle.StandardPixmap.SP_DialogResetButton)  # Reset/clear icon
+            view_icon = style.standardIcon(
+                QStyle.StandardPixmap.SP_FileDialogDetailedView)  # View icon
 
             # Set icons on buttons
             self.add_files_button.setIcon(self.file_icon)
@@ -286,6 +319,7 @@ class MergerSplitterApp(QWidget):
             self.remove_item_button.setIcon(remove_icon)
             self.clear_list_button.setIcon(clear_icon)
 
+            self.merge_view_button.setIcon(view_icon)
             self.merge_button.setIcon(merge_icon)
             self.split_button.setIcon(split_icon)
             self.merge_cancel_button.setIcon(cancel_icon)
@@ -352,7 +386,9 @@ class MergerSplitterApp(QWidget):
         self.progress_bar.setFormat("Finished")
 
         if success:
-            QMessageBox.information(self, "Operation Complete", message)
+            # Don't show a popup for successful text view, the dialog is the feedback
+            if "text view" not in message:
+                QMessageBox.information(self, "Operation Complete", message)
         else:
             # Only show warning popup if a critical error popup wasn't already shown
             if not self._error_shown:
@@ -382,6 +418,13 @@ class MergerSplitterApp(QWidget):
                     if hasattr(signals, 'log') and signals.log is not None:
                         try:
                             signals.log.disconnect(self.log)
+                        except TypeError:
+                            pass
+
+                    if hasattr(signals, 'text_ready') and signals.text_ready is not None:
+                        try:
+                            signals.text_ready.disconnect(
+                                self.show_text_result_dialog)
                         except TypeError:
                             pass
 
@@ -433,6 +476,11 @@ class MergerSplitterApp(QWidget):
             # Optionally force UI reset here too if error is unrecoverable
             # self._set_ui_enabled(True)
 
+    def show_text_result_dialog(self, text):
+        """Shows a dialog with the merged text."""
+        dialog = TextViewerDialog(text, self)
+        dialog.exec()
+
     def _reset_error_flag(self):
         """Reset the flag that tracks if a critical error message was shown."""
         self._error_shown = False
@@ -464,6 +512,8 @@ class MergerSplitterApp(QWidget):
         self.include_tree_checkbox.setEnabled(
             enabled)  # <<< Enable/disable checkbox
         # Enable merge button only if conditions met AND UI is enabled
+        self.merge_view_button.setEnabled(
+            enabled and self._can_start_merge_to_text())
         self.merge_button.setEnabled(enabled and self._can_start_merge())
         # Enable cancel button only if running AND on the merge tab
         self.merge_cancel_button.setEnabled(is_running and is_merge_tab_active)
@@ -479,12 +529,15 @@ class MergerSplitterApp(QWidget):
 
     def _can_start_merge(self):
         """Check if conditions are met to start merging."""
+        return self._can_start_merge_to_text() and bool(self.output_merge_file)
+
+    def _can_start_merge_to_text(self):
+        """Check if conditions are met to start merging to text view."""
         selected_format_name = self.merge_format_combo.currentText()
         format_ok = selected_format_name and selected_format_name in MERGE_FORMATS
-        # Check if internal list is not empty OR if the view model has items (more robust check)
         has_items = bool(self._items_to_merge_internal) or (
             self.item_model.rowCount() > 0)
-        return bool(has_items and self.output_merge_file and format_ok)
+        return bool(has_items and format_ok)
 
     def _can_remove_merge_items(self):
         """Check if items are present and selected in the merge list view."""
@@ -503,11 +556,13 @@ class MergerSplitterApp(QWidget):
         ui_enabled = not (
             self.worker_thread and self.worker_thread.isRunning())
 
-        can_merge = self._can_start_merge()
+        can_merge_to_file = self._can_start_merge()
+        can_merge_to_text = self._can_start_merge_to_text()
         can_remove = self._can_remove_merge_items()
         can_clear = self._can_clear_merge_items()
 
-        self.merge_button.setEnabled(ui_enabled and can_merge)
+        self.merge_button.setEnabled(ui_enabled and can_merge_to_file)
+        self.merge_view_button.setEnabled(ui_enabled and can_merge_to_text)
         self.remove_item_button.setEnabled(ui_enabled and can_remove)
         self.clear_list_button.setEnabled(ui_enabled and can_clear)
 
@@ -1203,8 +1258,8 @@ class MergerSplitterApp(QWidget):
 
         self.worker_thread = QThread(self)
         # --- Pass include_tree flag to worker ---
-        self.worker = MergerWorker(worker_data, self.output_merge_file, selected_format_details,
-                                   include_tree)  # <<< Pass flag here
+        self.worker = MergerWorker(worker_data, selected_format_details,
+                                   include_tree=include_tree, output_file=self.output_merge_file)
         # --- End passing flag ---
         self.worker.moveToThread(self.worker_thread)
 
@@ -1224,6 +1279,65 @@ class MergerSplitterApp(QWidget):
         self.worker_thread.started.connect(self.worker.run)
         self.worker_thread.start()
         self.log("Merge worker thread started.")
+
+    def start_merge_to_text(self):
+        """Starts the merge operation to an in-memory string and displays it."""
+        if not self._can_start_merge_to_text():
+            msg = "Cannot start merge. Please ensure:"
+            if not self._items_to_merge_internal and self.item_model.rowCount() == 0:
+                msg += "\n- Items have been added to the list."
+            if not self.merge_format_combo.currentText() or self.merge_format_combo.currentText() not in MERGE_FORMATS:
+                msg += "\n- A valid merge format is selected."
+            QMessageBox.warning(self, "Merge Error", msg)
+            self.log(
+                f"Merge to text aborted: Conditions not met. Reason: {msg.replace(':', ' -').replace('n- ', ' ')}")
+            return
+
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(
+                self, "Busy", "Another operation is already in progress.")
+            self.log("Merge to text aborted: Another worker is active.")
+            return
+
+        selected_format_name = self.merge_format_combo.currentText()
+        selected_format_details = MERGE_FORMATS.get(selected_format_name)
+        if not selected_format_details:
+            QMessageBox.critical(
+                self, "Internal Error", f"Selected merge format '{selected_format_name}' not found in configuration.")
+            self.log(
+                f"CRITICAL Error: Cannot find details for merge format '{selected_format_name}'.")
+            return
+
+        include_tree = self.include_tree_checkbox.isChecked()
+
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting Merge to Text...")
+        self._set_ui_enabled(False)
+        self._reset_error_flag()
+
+        worker_data = list(self._items_to_merge_internal)
+        self.log(
+            f"Starting merge to text with {len(worker_data)} items using format '{selected_format_name}'.")
+        if include_tree:
+            self.log("Including file hierarchy tree at the start.")
+
+        self.worker_thread = QThread(self)
+        self.worker = MergerWorker(
+            worker_data, selected_format_details, include_tree=include_tree)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker.signals.progress.connect(self.update_progress)
+        self.worker.signals.log.connect(self.log)
+        self.worker.signals.error.connect(self.operation_error)
+        self.worker.signals.text_ready.connect(self.show_text_result_dialog)
+        self.worker.signals.finished.connect(self.operation_finished)
+
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker_thread.start()
+        self.log("Merge to text worker thread started.")
 
     def start_split(self):
         """Starts the split operation in a background thread using the selected format."""

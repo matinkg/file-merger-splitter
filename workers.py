@@ -3,6 +3,7 @@ import re
 import pathlib
 import traceback
 from PyQt6.QtCore import QObject, pyqtSignal
+from io import StringIO
 
 # --- Worker Signals ---
 
@@ -13,6 +14,8 @@ class WorkerSignals(QObject):
     log = pyqtSignal(str)            # Log message
     finished = pyqtSignal(bool, str)  # Success (bool), final message (str)
     error = pyqtSignal(str)          # Error message used for critical failures
+    # Emits the merged text when finished in-memory
+    text_ready = pyqtSignal(str)
 
 
 # --- Hierarchy Tree Delimiters (Used by both workers) ---
@@ -26,12 +29,11 @@ class MergerWorker(QObject):
     ''' Performs the file merging in a separate thread using a specified format. '''
     signals = WorkerSignals()
 
-    # --- Update __init__ to accept include_tree ---
-    def __init__(self, items_to_merge, output_file, merge_format_details, include_tree=False):
+    def __init__(self, items_to_merge, merge_format_details, include_tree=False, output_file=None):
         super().__init__()
         self.items_to_merge = items_to_merge
         self.output_file = output_file
-        self.format_details = merge_format_details
+        self.merge_format_details = merge_format_details
         self.include_tree = include_tree
         self.is_running = True
 
@@ -135,8 +137,13 @@ class MergerWorker(QObject):
         return final_string
 
     def run(self):
-        self.log(
-            f"Starting merge process -> {self.output_file} (Format: {self.format_details['name']})")
+        if self.output_file:
+            self.log(
+                f"Starting merge process -> {self.output_file} (Format: {self.merge_format_details['name']})")
+        else:
+            self.log(
+                f"Starting merge to text view (Format: {self.merge_format_details['name']})")
+
         if self.include_tree:
             self.log("File hierarchy tree will be included.")
 
@@ -145,12 +152,13 @@ class MergerWorker(QObject):
         processed_size = 0
         processed_files_count = 0
         encountered_resolved_paths = set()
+        output_file_path = None
 
-        start_fmt = self.format_details.get("start", "{filepath}")
-        end_fmt = self.format_details.get("end", "")
-        separator = self.format_details.get("file_separator", "\n")
-        content_prefix = self.format_details.get("content_prefix", "")
-        content_suffix = self.format_details.get("content_suffix", "")
+        start_fmt = self.merge_format_details.get("start", "{filepath}")
+        end_fmt = self.merge_format_details.get("end", "")
+        separator = self.merge_format_details.get("file_separator", "\n")
+        content_prefix = self.merge_format_details.get("content_prefix", "")
+        content_suffix = self.merge_format_details.get("content_suffix", "")
 
         try:
             # --- Phase 1: Discover all files ---
@@ -322,19 +330,27 @@ class MergerWorker(QObject):
             self.signals.progress.emit(0)
 
             # --- Phase 2: Write the files using the selected format ---
-            output_file_path = pathlib.Path(self.output_file)
-            try:
-                output_file_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                self.log(
-                    f"Error: Could not create output directory {output_file_path.parent}: {e}")
-                self.signals.error.emit(
-                    f"Failed to create output directory: {e}")
-                self.signals.finished.emit(
-                    False, "Merge failed: Could not create output directory.")
-                return
+            outfile_context = None
+            if self.output_file:
+                output_file_path = pathlib.Path(self.output_file)
+                try:
+                    output_file_path.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    self.log(
+                        f"Error: Could not create output directory {output_file_path.parent}: {e}")
+                    self.signals.error.emit(
+                        f"Failed to create output directory: {e}")
+                    self.signals.finished.emit(
+                        False, "Merge failed: Could not create output directory.")
+                    return
+                outfile_context = open(
+                    output_file_path, "w", encoding="utf-8", errors='replace')
+            else:
+                outfile_context = StringIO()
 
-            with open(output_file_path, "w", encoding="utf-8", errors='replace') as outfile:
+            result_text = None
+
+            with outfile_context as outfile:
                 # --- Write Hierarchy Tree if requested ---
                 if self.include_tree:
                     self.log("Generating and writing hierarchy tree...")
@@ -416,22 +432,34 @@ class MergerWorker(QObject):
                         progress_percent = 0
                     self.signals.progress.emit(min(progress_percent, 100))
 
+                if self.is_running and not self.output_file:
+                    result_text = outfile.getvalue()
+
             # --- Final checks and signals ---
             if not self.is_running:
                 self.log("Merge cancelled during writing phase.")
-                try:
-                    if output_file_path.exists():
+                if self.output_file and output_file_path and output_file_path.exists():
+                    try:
                         output_file_path.unlink()
-                    self.log(f"Removed incomplete file: {output_file_path}")
-                except OSError as e:
-                    self.log(
-                        f"Could not remove incomplete file '{output_file_path}': {e}")
+                        self.log(
+                            f"Removed incomplete file: {output_file_path}")
+                    except OSError as e:
+                        self.log(
+                            f"Could not remove incomplete file '{output_file_path}': {e}")
                 self.signals.finished.emit(False, "Merge cancelled.")
-            else:
+            elif self.output_file:
                 self.signals.progress.emit(100)
                 self.log("Merge process completed successfully.")
                 self.signals.finished.emit(
-                    True, f"Merge successful! {len(files_to_process)} files merged into '{output_file_path.name}'.")
+                    True, f"Merge successful! {len(files_to_process)} files merged into '{pathlib.Path(self.output_file).name}'.")
+            else:  # In-memory merge finished
+                self.signals.progress.emit(100)
+                self.log("Merge to text completed successfully.")
+                if result_text is not None:
+                    self.signals.text_ready.emit(result_text)
+                self.signals.finished.emit(
+                    True, f"Merge successful! {len(files_to_process)} files merged to text view.")
+
         except Exception as e:
             self.log(
                 f"An unexpected error occurred during merge: {e}\n{traceback.format_exc()}")
