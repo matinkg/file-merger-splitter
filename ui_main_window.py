@@ -43,11 +43,26 @@ class TextViewerDialog(QDialog):
 
         layout.addWidget(self.text_edit)
 
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box = QDialogButtonBox()
+        copy_button = QPushButton("Copy")
+        copy_button.clicked.connect(self.copy_to_clipboard)
+        button_box.addButton(
+            copy_button, QDialogButtonBox.ButtonRole.ActionRole)
+
+        button_box.addButton(QDialogButtonBox.StandardButton.Close)
         # .rejected is the standard signal for "Cancel" or "Close"
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+    def copy_to_clipboard(self):
+        QApplication.clipboard().setText(self.text_edit.toPlainText())
+
+        # write to log
+        self.parent().log("Merged text copied to clipboard.")
+
+        # Show success message
+        # QMessageBox.information(self, "Copied to Clipboard",
+        #                         "Merged text has been copied to clipboard.")
 
 # --- Main Application Window ---
 class MergerSplitterApp(QWidget):
